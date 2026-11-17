@@ -68,8 +68,11 @@ What it refuses to store, by default:
 
 ## Requirements
 
-- **Node.js 22.5+** (uses the built-in `node:sqlite`; no native build step, no
-  `better-sqlite3`). The Docker image pins `node:22-alpine`.
+- **Node.js 22.13+** (uses the built-in `node:sqlite`; no native build step, no
+  `better-sqlite3`). The Docker image pins `node:22-alpine`, which is fine — it
+  tracks the latest 22.x. The floor is 22.13 rather than the 22.5 that introduced
+  `node:sqlite` because the module is gated behind `--experimental-sqlite` before
+  22.13, and importing it unflagged there fails with `ERR_UNKNOWN_BUILTIN_MODULE`.
 - **A Discord application** with a bot user in exactly one guild.
 - A few tens of MB of RAM and a few MB of disk per year of daily rollups.
 - Optional: **Docker** + Compose v2 (the recommended path), and **Open WebUI** if
@@ -87,7 +90,7 @@ event windows still line up with the data.
 ## Quick start (Docker)
 
 ```bash
-git clone https://github.com/<you>/discord-metrics-bot.git
+git clone https://github.com/mark-zeroo/discord-metrics-bot.git
 cd discord-metrics-bot
 
 cp .env.example .env
@@ -188,7 +191,7 @@ that lacks the permission to look.
 ## Bare-metal install
 
 ```bash
-git clone https://github.com/<you>/discord-metrics-bot.git
+git clone https://github.com/mark-zeroo/discord-metrics-bot.git
 cd discord-metrics-bot
 cp .env.example .env           # .env stays at the repository root, beside compose
 $EDITOR .env                   # DISCORD_TOKEN, DISCORD_GUILD_ID, DATA_DIR
@@ -1304,7 +1307,7 @@ anyway.
 
 ```bash
 cd app                       # the Node project; every npm command lives here
-npm test                     # 169 tests, node:test, no test framework needed
+npm test                     # 205 tests, node:test, no test framework needed
 npm test -- --test-name-pattern restart
 node --test test/repair.test.mjs
 ```

@@ -13,9 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # engines is >=22.5.0 because node:sqlite arrives in 22.5. Test the floor
+        # engines is >=22.13.0: node:sqlite exists from 22.5 but is gated behind
+        # --experimental-sqlite until 22.13, so 22.5-22.12 fail with
+        # ERR_UNKNOWN_BUILTIN_MODULE. Test the real floor, not the announced one.
         # and the newest LTS rather than "whatever ubuntu ships".
-        node: ['22.5', '22.x', '24.x']
+        node: ['22.13', '22.x', '24.x']
     defaults:
       run:
         working-directory: app
