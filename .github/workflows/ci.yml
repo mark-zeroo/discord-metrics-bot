@@ -40,16 +40,19 @@ jobs:
         with:
           python-version: '3.12'
       # The filter/tool declare their valves with pydantic, which Open WebUI
-      # supplies at runtime. py_compile would pass without it (it does not execute
-      # imports) but the selftest imports the module for real, so install it.
+      # supplies at runtime. The selftest falls back to a stub when pydantic is
+      # absent so that `npm test` works on a bare machine, so this job is the one
+      # place that must run against the real library.
       - name: Install filter deps
         run: python -m pip install 'pydantic>=2'
       - name: Compile check
         working-directory: app
         run: python3 -m py_compile openwebui/*.py
-      - name: Filter selftest
+      - name: Filter selftest (real pydantic, not the stub)
         working-directory: app
-        run: python3 openwebui/filter_selftest.py
+        run: |
+          python3 openwebui/filter_selftest.py | tee /tmp/selftest.out
+          grep -q '(pydantic: real)' /tmp/selftest.out
 
   compose:
     name: compose config

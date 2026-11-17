@@ -13,8 +13,42 @@ import asyncio
 import copy
 import os
 import sys
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    import pydantic  # noqa: F401
+
+    PYDANTIC_MODE = "real"
+except ModuleNotFoundError:
+    # The filter declares its valves as a pydantic model, and Open WebUI supplies
+    # pydantic at runtime. Nothing here exercises validation — only the valve
+    # defaults — so a stand-in keeps this selftest runnable on a bare machine.
+    # `npm test` shells out to this file, and the node job has no pydantic; without
+    # this it fails there with ModuleNotFoundError while passing on any dev box that
+    # happens to have it installed.
+    class _Field:
+        def __init__(self, default=None, **_kwargs):
+            self.default = default
+
+    class _BaseModel:
+        def __init__(self, **kwargs):
+            for cls in reversed(type(self).__mro__):
+                for name, value in vars(cls).items():
+                    if isinstance(value, _Field):
+                        setattr(self, name, value.default)
+            for name, value in kwargs.items():
+                setattr(self, name, value)
+
+        def model_dump(self, *_args, **_kwargs):
+            return {k: v for k, v in vars(self).items() if not k.startswith("_")}
+
+    _stub = types.ModuleType("pydantic")
+    _stub.BaseModel = _BaseModel
+    _stub.Field = lambda default=None, **kw: _Field(default, **kw)
+    sys.modules["pydantic"] = _stub
+    PYDANTIC_MODE = "stub"
 
 import metrics_filter as f  # noqa: E402
 
@@ -336,7 +370,7 @@ def main():
         except Exception as exc:  # noqa: BLE001 - report, do not abort the suite
             failed += 1
             print(f"ERROR {name}\n        {type(exc).__name__}: {exc}")
-    print(f"{len(CHECKS) - failed}/{len(CHECKS)} filter checks passed")
+    print(f"{len(CHECKS) - failed}/{len(CHECKS)} filter checks passed (pydantic: {PYDANTIC_MODE})")
     return 1 if failed else 0
 
 
