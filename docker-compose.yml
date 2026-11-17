@@ -1,0 +1,97 @@
+# Default deployment: NAMED VOLUME, unprivileged, no host permissions involved.
+#
+# This is the file that avoids the whole chown problem. A named volume is created
+# and owned by Docker from the image's /data directory, which the Dockerfile
+# already chowns to `node`. There is no host path, so there is nothing for
+# rootless uid mapping to get wrong.
+#
+# The volume is `metrics-data`. Renaming this key does NOT move the data: Docker
+# mounts a new, empty volume and the bot starts with an empty history. If you ever
+# rename it, migrate once with the stack stopped (README -> Operations -> Backups):
+#
+#   docker volume ls                          # find the old volume's real name
+#   docker compose down
+#   docker volume create metrics-data
+#   docker run --rm -v <old-volume>:/from -v metrics-data:/to alpine \
+#     sh -c 'cd /from && cp -av . /to/'
+#   docker compose up -d
+#   docker volume rm <old-volume>             # only after /v1/quality looks right
+#
+# Want a plain host directory instead? Use the overlay:
+#   docker compose -f docker-compose.yml -f docker-compose.bindmount.yml up -d
+
+services:
+  metrics:
+    # Context is the REPO ROOT, not app/: the Dockerfile and docker/entrypoint.sh live
+    # here, and a Dockerfile cannot COPY from outside its own context. The Node project
+    # is in app/ and the Dockerfile app/-prefixes every COPY, so this stays `build: .`.
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      # 0.0.0.0 is safe here: the container has its own network namespace and is
+      # only published to 127.0.0.1. ALLOW_PUBLIC_BIND is the config guard that
+      # stops this from silently happening on a bare-metal host.
+      API_HOST: 0.0.0.0
+      # Pinned so the published port above always has a matching listener, even
+      # if .env sets API_PORT for a bare-metal run on the same host.
+      API_PORT: 8283
+      ALLOW_PUBLIC_BIND: "true"
+      API_ALLOWED_IPS: "127.0.0.1,::1,172.16.0.0/12"
+    ports:
+      # Published to loopback only, for debugging from the host. The container itself
+      # binds 0.0.0.0 inside its own network namespace, so this publish is the only
+      # thing that could expose it beyond the host — and it does not. Callers in other
+      # compose projects reach the API over the shared network below, which needs no
+      # published port at all.
+      - "127.0.0.1:${API_PORT:-8283}:8283"
+    volumes:
+      - metrics-data:/data
+    networks:
+      metrics-net:
+        # Stable DNS name for callers in OTHER compose projects. Docker also adds the
+        # service name (`metrics`) as an alias, but a generic name like that can collide
+        # with another project's service on a shared network; `discord-metrics` cannot.
+        aliases:
+          - discord-metrics
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # Pinned with an explicit `name:` so the volume is literally `metrics-data` rather
+  # than <compose-project>_metrics-data. Two reasons: the backup and restore commands
+  # below can then name the volume once and stay correct if the project directory is
+  # ever renamed, and no name in this file carries a leftover project prefix.
+  #
+  # The trade-off is one instance per host: a second checkout of this repo would share
+  # the same volume. Delete the `name:` line to go back to project-scoped naming
+  # (<compose-project>_metrics-data) if you ever run two bots on one machine.
+  metrics-data:
+    name: metrics-data
+
+networks:
+  # Created once by hand, deliberately not owned by this project:
+  #   docker network create --subnet 172.28.0.0/24 metrics-net
+  # External, so `docker compose down` here never tears down the network out from under
+  # a separately-managed Open WebUI. The pinned subnet sits inside 172.16.0.0/12, which
+  # is why API_ALLOWED_IPS above already covers it without further configuration.
+  #
+  # The network name is fixed rather than project-scoped on purpose: it is created
+  # outside this project and Open WebUI's container is attached to it by name, so
+  # renaming it is a coordinated change across two deployments, not a one-line edit.
+  metrics-net:
+    external: true
+    name: metrics-net

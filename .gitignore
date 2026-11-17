@@ -1,0 +1,28 @@
+# --- secrets ---------------------------------------------------------------
+.env
+
+# --- app (Node) ------------------------------------------------------------
+# Patterns without a leading slash match at any depth, so these also cover app/.
+node_modules/
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+tokens.json
+
+# --- app (Python, Open WebUI tooling) --------------------------------------
+__pycache__/
+*.pyc
+
+# --- host runtime data -----------------------------------------------------
+# The repo-root data/ directory is the bind-mount source for
+# docker-compose.bindmount.yml. Its contents are runtime state, but the directory
+# itself has to exist in a fresh clone or Docker creates it as root on first up.
+data/*
+!data/.gitkeep
+
+# --- noise -----------------------------------------------------------------
+.DS_Store

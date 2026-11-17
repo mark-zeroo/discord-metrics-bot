@@ -1,0 +1,32 @@
+{
+  "name": "discord-metrics-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-only Discord analytics collector with a loopback JSON API for LLM tool use.",
+  "license": "MIT",
+  "author": "discord-metrics-bot contributors",
+  "keywords": [
+    "discord",
+    "discord.js",
+    "analytics",
+    "metrics",
+    "sqlite",
+    "open-webui",
+    "llm-tools"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "token": "node scripts/issue-token.mjs",
+    "sync-prompt": "node scripts/sync-prompt.mjs",
+    "tag": "node --disable-warning=ExperimentalWarning src/cli/tag.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.mjs",
+    "repair": "node --disable-warning=ExperimentalWarning src/cli/repair.js"
+  },
+  "dependencies": {
+    "discord.js": "14.28.1"
+  }
+}

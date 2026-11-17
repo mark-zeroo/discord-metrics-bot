@@ -1,0 +1,14 @@
+# Build context is the REPOSITORY ROOT (see the note at the top of the Dockerfile):
+# the Dockerfile and docker/entrypoint.sh live here, and a Dockerfile cannot COPY from
+# outside its context. Everything the image needs is under app/, so everything else is
+# kept out of the context — the shorter the context, the smaller the chance of shipping
+# something by accident.
+app/node_modules
+app/test
+app/openwebui
+data
+.env
+.env.*
+.git
+**/__pycache__
+*.log

@@ -1,0 +1,37 @@
+# Overlay for a HOST BIND MOUNT (./data on your disk) instead of a named volume.
+#
+#   PUID=$(id -u) PGID=$(id -g) docker compose \
+#     -f docker-compose.yml -f docker-compose.bindmount.yml up -d --build
+#
+# Use this when you want to inspect or back up the SQLite file directly.
+#
+# What it changes and why:
+#
+#   user: "0:0"   start as root so the entrypoint can chown, then su-exec drops
+#                 to PUID:PGID permanently. The app process is still unprivileged;
+#                 root exists only for the microseconds before exec.
+#   PUID/PGID     who to drop to. Use the host uid that owns ./data, which under
+#                 rootless docker is NOT 1000 — check with `stat -c %u ./data`.
+#   cap_add       the minimum needed to chown and then drop: CHOWN, FOWNER,
+#                 DAC_OVERRIDE, SETUID, SETGID. Everything else stays dropped.
+
+services:
+  metrics:
+    user: "0:0"
+    environment:
+      DATA_DIR: /data
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    volumes:
+      # Repo-root data/ — the same directory .gitignore keeps empty-but-present via
+      # data/.gitkeep. Relative to THIS compose file, so it stays ./data even though
+      # the application itself lives in app/.
+      - ./data:/data
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  node:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines is >=22.5.0 because node:sqlite arrives in 22.5. Test the floor
+        # and the newest LTS rather than "whatever ubuntu ships".
+        node: ['22.5', '22.x', '24.x']
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  python:
+    name: openwebui artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The filter/tool declare their valves with pydantic, which Open WebUI
+      # supplies at runtime. py_compile would pass without it (it does not execute
+      # imports) but the selftest imports the module for real, so install it.
+      - name: Install filter deps
+        run: python -m pip install 'pydantic>=2'
+      - name: Compile check
+        working-directory: app
+        run: python3 -m py_compile openwebui/*.py
+      - name: Filter selftest
+        working-directory: app
+        run: python3 openwebui/filter_selftest.py
+
+  compose:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # docker-compose.yml declares `env_file: .env` and .env is gitignored, so a
+      # fresh checkout cannot be parsed without one. Creating it from the example
+      # also proves the example is complete enough to boot.
+      - name: Provide .env from the example
+        run: cp .env.example .env
+      # Validates the YAML and that every ${VAR} has a default; catches the
+      # class of edit that only fails on the host, mid-deploy.
+      - run: docker compose config --quiet

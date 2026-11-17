@@ -1,0 +1,24 @@
+# Normalise everything to LF in the repository and in working trees.
+# The collector, the shell scripts and the Dockerfile all run on Linux; a CRLF
+# checkout would break doctor.sh and the openwebui selftest's inline scripts.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+# Never diff or merge binary artefacts.
+*.db      binary
+*.db-wal  binary
+*.db-shm  binary
+*.png     binary
+*.jpg     binary
+*.pyc     binary
+
+# Keep GitHub's language bar honest: the test suite is larger than the source.
+app/test/*        linguist-documentation=false
+app/openwebui/*.py linguist-language=Python
