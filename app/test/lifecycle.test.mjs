@@ -185,15 +185,33 @@ test('rows are capped with explicit truncation, and the stage summary covers all
   assert.equal(out.channels[0].name, 'busy-5');
 });
 
-test('coverage says when the collector was not running for the window', () => {
+test('coverage is measured from when heartbeats began, not from the window start', () => {
   const db = openDb(':memory:');
-  // Only 5 days of heartbeats in a 30-day window.
+  // Only 5 days of heartbeats in a 30-day window, because the heartbeat table was
+  // introduced yesterday. Reporting "5 of 30 days" would claim the collector was
+  // down for 25 of them, which is false.
   for (let d = 0; d <= 4; d += 1) heartbeat(db, day(d));
   channel(db, { name: 'idle' });
 
   const out = channelLifecycle(db, cfg(), { window: window30, ts: TS });
   assert.equal(out.coverage.days_with_heartbeat, 5);
-  assert.match(out.coverage.note, /only 5 of \d+ days/);
+  assert.equal(out.coverage.heartbeat_days_in_window, 5);
+  assert.equal(out.coverage.heartbeat_since, `${isoDate(day(4))}T00:00:00Z`.slice(0, 10));
+  assert.match(out.coverage.note, /ran on every day since heartbeats began/);
+  // It still says plainly that the earlier days have no heartbeat.
+  assert.match(out.coverage.note, /have no heartbeat even though collection ran/);
+});
+
+test('a genuine gap inside the heartbeat era is reported as a gap', () => {
+  const db = openDb(':memory:');
+  // Heartbeats for every day except one, all inside the heartbeat era.
+  for (let d = 0; d <= 9; d += 1) if (d !== 5) heartbeat(db, day(d));
+  channel(db, { name: 'idle' });
+
+  const out = channelLifecycle(db, cfg(), { window: window30, ts: TS });
+  assert.equal(out.coverage.days_with_heartbeat, 9);
+  assert.equal(out.coverage.heartbeat_days_in_window, 10);
+  assert.match(out.coverage.note, /recorded 9 of 10 days/);
   assert.match(out.coverage.note, /lower bound/);
 });
 
@@ -239,4 +257,32 @@ test('creation dates come from structure changes, and are null when unknown', ()
   assert.equal(stageOf(out, 'unknown').created, null);
   // First observed activity is the fallback for classification.
   assert.equal(stageOf(out, 'unknown').first_activity, `${isoDate(day(2))}T00:00:00Z`);
+});
+
+test('never_used is bounded by collection start, not by the channel lifetime', () => {
+  const db = openDb(':memory:');
+  db.setMeta('backfill.completed', '2026-11-10T18:46:28.383Z');
+  channel(db, { name: 'quiet-forever' });
+
+  const out = channelLifecycle(db, cfg(), { window: window30, ts: TS });
+  const row = stageOf(out, 'quiet-forever');
+  assert.equal(row.stage, 'never_used');
+  assert.match(row.stage_reason, /since 2026-11-10/);
+  assert.doesNotMatch(row.stage_reason, /ever/);
+  assert.match(row.stage_reason, /not over the channel's life/);
+});
+
+test('a near-empty first half is described with counts, not a huge percentage', () => {
+  const db = openDb(':memory:');
+  for (let d = 0; d <= 30; d += 1) heartbeat(db, day(d));
+  const id = channel(db, { name: 'ramped-up' });
+  msgs(db, id, day(20), 1);
+  msgs(db, id, day(5), 358);
+
+  const out = channelLifecycle(db, cfg(), { window: window30, ts: TS });
+  const row = stageOf(out, 'ramped-up');
+  assert.equal(row.stage, 'growing');
+  // "up 35700%" is arithmetic, not insight.
+  assert.doesNotMatch(row.stage_reason, /%/);
+  assert.match(row.stage_reason, /went from 1 to 358/);
 });

@@ -98,6 +98,12 @@ export function channelLifecycle(
     ...[...everVoice.values()].map((r) => r.first_day),
   );
   const serverDataFrom = earliestData === null ? null : dayOf(earliestData);
+  // How long the collector has existed, for wording that must not claim "ever".
+  const collectionStartLabel = (() => {
+    const backfill = db.getMeta('backfill.completed');
+    if (backfill) return String(backfill).slice(0, 10);
+    return earliestData === null ? null : isoDate(earliestData);
+  })();
   // With no activity anywhere, the window still starts where it was asked to. Using
   // "now" made a completely idle server report a one-day coverage window.
   const effectiveStart = Math.max(windowStart, serverDataFrom ?? windowStart);
@@ -137,12 +143,30 @@ export function channelLifecycle(
 
   // Coverage of the window itself: a channel with no traffic in a window the bot
   // was down for most of is not a channel with no traffic.
+  // Heartbeats only start when this version does, so on an upgrade they cover less
+  // of the window than collection does. Reporting "1 of 10 days observed" would
+  // claim the collector was down for nine of them. Coverage is therefore measured
+  // from the later of the window start and the first heartbeat, and activity days
+  // are reported beside it as corroboration for the days before that.
+  const heartbeatSince = db.get('SELECT MIN(day_ts) AS v FROM collector_day')?.v ?? null;
+  const coverageFrom = Math.max(effectiveStart, heartbeatSince ?? effectiveStart);
   const observedDays = db.get(
     'SELECT COUNT(*) AS n FROM collector_day WHERE day_ts >= ? AND day_ts <= ?',
+    coverageFrom,
+    today,
+  )?.n ?? 0;
+  const activityDays = db.get(
+    `SELECT COUNT(*) AS n FROM (
+       SELECT day_ts FROM message_day WHERE day_ts >= ? AND day_ts <= ?
+       UNION SELECT day_ts FROM voice_day WHERE day_ts >= ? AND day_ts <= ?
+     )`,
+    effectiveStart,
+    today,
     effectiveStart,
     today,
   )?.n ?? 0;
   const windowDays = Math.max(1, Math.round((today - effectiveStart) / DAY) + 1);
+  const coverageDays = Math.max(1, Math.round((today - coverageFrom) / DAY) + 1);
 
   const rows = channels.map((ch) => {
     const seen = ch.bot_can_view === 1 ? true : ch.bot_can_view === 0 ? false : null;
@@ -193,10 +217,15 @@ export function channelLifecycle(
     } else if (lastEver === null) {
       if (createdTs !== null && createdTs >= from) {
         stage = 'created_unused';
-        stageReason = `created ${isoDate(createdTs)} and no message or voice has been recorded since`;
+        stageReason =
+          `created ${isoDate(createdTs)} and no message or voice has been recorded since` +
+          (collectionStartLabel ? ` (collection began ${collectionStartLabel})` : '');
       } else {
         stage = 'never_used';
-        stageReason = 'no message or voice has ever been recorded here';
+        stageReason =
+          'no message or voice has been recorded here' +
+          (collectionStartLabel ? ` since ${collectionStartLabel}` : '') +
+          ': absence over that span, not over the channel\'s life';
       }
     } else if (lastEver < dormantCutoff) {
       stage = 'dormant';
@@ -219,10 +248,10 @@ export function channelLifecycle(
       stageReason = `created ${isoDate(createdTs)}, inside the window`;
     } else if (trend && trend.change !== null && trend.change > DORMANT_TREND_THRESHOLD) {
       stage = 'growing';
-      stageReason = `messages up ${Math.round(trend.change * 100)}% between the two halves of the window`;
+      stageReason = describeChange(trend, 'up');
     } else if (trend && trend.change !== null && trend.change < -DORMANT_TREND_THRESHOLD) {
       stage = 'declining';
-      stageReason = `messages down ${Math.round(Math.abs(trend.change) * 100)}% between the two halves of the window`;
+      stageReason = describeChange(trend, 'down');
     } else if (trend && trend.change === null && messages > 0) {
       // All activity landed in the second half: there is nothing to divide by, and
       // calling that "flat" would be wrong.
@@ -283,12 +312,24 @@ export function channelLifecycle(
     coverage: {
       window_days: windowDays,
       days_with_heartbeat: observedDays,
+      heartbeat_days_in_window: coverageDays,
+      heartbeat_since: heartbeatSince === null ? null : isoDate(heartbeatSince),
+      days_with_activity: activityDays,
       note:
-        observedDays < windowDays
-          ? `The collector recorded only ${observedDays} of ${windowDays} days in this window. ` +
-            'Channels with no traffic in the rest were not observed then, and a "dormant" call ' +
-            'across that gap is a lower bound, not a finding.'
-          : 'The collector ran on every day of this window, so an empty channel was watched and empty.',
+        heartbeatSince === null
+          ? 'No heartbeats have been recorded yet, so there is no independent evidence of which ' +
+            'days the collector was watching. Activity days are the only signal available, and a ' +
+            'dormant call across a gap is a lower bound, not a finding.'
+          : observedDays < coverageDays
+            ? `The collector recorded ${observedDays} of ${coverageDays} days since heartbeats began ` +
+              `(${isoDate(heartbeatSince)}). Channels with no traffic in the rest were not observed ` +
+              'then, and a dormant call across that gap is a lower bound, not a finding.'
+            : `The collector ran on every day since heartbeats began (${isoDate(heartbeatSince)}), ` +
+              'so an empty channel was watched and empty.' +
+              (heartbeatSince > effectiveStart
+                ? ` Days before ${isoDate(heartbeatSince)} have no heartbeat even though collection ` +
+                  `ran: ${activityDays} day(s) in this window carry activity.`
+                : ''),
     },
     thresholds: {
       dormant_days: dormantDays,
@@ -299,6 +340,21 @@ export function channelLifecycle(
     caveats: caveats({ dormantDays, minMessages }),
     quality: quality(db, config, ts),
   };
+}
+
+/**
+ * "up 31%" is useful; "up 35700%" is arithmetic masquerading as insight. Past a
+ * tenfold change the counts are the readable statement, so quote those instead.
+ */
+function describeChange(trend, direction) {
+  const { first_half_messages: before, second_half_messages: after, change } = trend;
+  if (Math.abs(change) >= 10) {
+    return (
+      `messages went from ${before} to ${after} between the two halves of the window ` +
+      `(${direction === 'up' ? 'a step up' : 'a step down'} from a near-empty baseline)`
+    );
+  }
+  return `messages ${direction} ${Math.round(Math.abs(change) * 100)}% between the two halves of the window`;
 }
 
 function minOf(...values) {
@@ -326,7 +382,10 @@ function caveats({ dormantDays, minMessages }) {
 function quality(db, config, ts) {
   return {
     generated_at: iso(ts),
-    structure_observed_at: db.getMeta('structure.refreshed_ts') ?? null,
+    structure_observed_at: (() => {
+      const raw = Number(db.getMeta('structure.refreshed_ts') ?? 0);
+      return raw > 0 ? iso(raw) : null;
+    })(),
     min_cell: config.privacy.minCell,
   };
 }
