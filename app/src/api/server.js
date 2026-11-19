@@ -13,6 +13,7 @@ import {
 } from './params.js';
 import * as Q from './queries.js';
 import { retention, RETENTION_PERIODS } from './cohorts.js';
+import { coreConcentration } from './core.js';
 
 // Both come from config (API_MAX_RESPONSE_KB / AUDIT_FLUSH_SECONDS); these are
 // only the values used when a caller builds the server without a config object.
@@ -126,6 +127,19 @@ export function createApiServer({ config, db, logger, collectors = null }) {
         cohort: parseEnum(params, 'cohort', ['week', 'day'], 'week'),
         periods: parsePeriods(params, RETENTION_PERIODS, [1, 7, 30]),
         limit: parseIntParam(params, 'limit', 12, 1, 52),
+        ts,
+      });
+    },
+
+    // Core concentration and core churn. `share` is the fraction of active members
+    // that counts as core; only the decimal form is accepted so "20" cannot be
+    // read as either 20% or twenty times.
+    'GET /v1/core': (params, ts) => {
+      rejectUnknownParams(params, ['window', 'bucket', 'share']);
+      return coreConcentration(db, config, {
+        window: parseWindow(params, '90d'),
+        bucket: parseBucket(params, 'week'),
+        share: parseFraction(params, 'share', config.analytics.coreShare, { min: 0.02, max: 0.5 }),
         ts,
       });
     },
