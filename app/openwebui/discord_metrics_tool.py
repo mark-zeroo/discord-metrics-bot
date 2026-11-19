@@ -1,10 +1,10 @@
 """
 title: Discord Server Metrics
 author: discord-metrics-bot contributors
-version: 1.2.5
+version: 1.3.0
 required_open_webui_version: 0.5.0
 license: MIT
-description: Read-only, aggregate-only access to Discord server metrics (members, messages, voice, growth, engagement concentration, tagged events, server structure) via the local discord-metrics API.
+description: Read-only, aggregate-only access to Discord server metrics (members, messages, voice, growth, engagement concentration, cohort retention, core concentration, channel lifecycle, tagged events, server structure) via the local discord-metrics API.
 
 Why this shape:
 
@@ -350,6 +350,115 @@ class Tools:
         if window is None:
             return json.dumps({"error": "invalid_window", "allowed": list(WINDOWS)})
         return json.dumps(self._get("/v1/engagement", {"window": window}), separators=(",", ":"))
+
+    def get_cohort_retention(
+        self, cohort: str = "week", periods: str = "1,7,30", window: str = "365d"
+    ) -> str:
+        """
+        Cohort retention: of the members who joined in a given day or week, what share
+        was still active 1, 7 or 30 days later (on that specific UTC day after joining).
+        Use for "do new members stick", "are we onboarding better than in spring", and
+        "is the churn at day 1 or day 30".
+
+        Read the status on every cell before quoting it. A null is never zero:
+          suppressed_small_count — too few people to publish without pointing at someone;
+          immature — that day has not happened yet for this cohort (a 4-day-old cohort has
+            no D30);
+          unmeasured — the day predates per-member collection or the bot was down for it.
+        `left_before_day_any` says some of the cohort left before the day was measured, so a
+        low rate is a departure, not a lapse. Pooled rates are withheld whenever a cohort
+        feeding them is withheld.
+
+        :param cohort: week (default) or day — how joiners are grouped.
+        :param periods: comma-separated days, drawn from 1,7,14,30. Default 1,7,30.
+        :param window: 1d, 7d, 30d, 90d, 365d, or all — which cohorts are included, by join
+            date. Default 365d.
+        :return: JSON object with cohorts, pooled, basis, suppression and a status legend.
+        """
+        window = normalize_window(window)
+        if window is None:
+            return json.dumps({"error": "invalid_window", "allowed": list(WINDOWS)})
+        cohort = (cohort or "week").strip().lower()
+        if cohort not in ("week", "day"):
+            return json.dumps({"error": "invalid_cohort", "allowed": ["week", "day"]})
+        periods = (periods or "1,7,30").replace(" ", "")
+        return json.dumps(
+            self._get(
+                "/v1/retention",
+                {"cohort": cohort, "periods": periods, "window": window, "limit": 12},
+            ),
+            separators=(",", ":"),
+        )
+
+    def get_core_concentration(self, window: str = "90d", bucket: str = "week", share: float = 0.2) -> str:
+        """
+        The core of regulars over time: how concentrated messaging is, and what happens to
+        the people who were in the core last period. Use for "is the server carried by
+        fewer people than it used to be" and "are our regulars burning out".
+
+        Core is the top `share` of *active* members by messages in each period, so it is a
+        shape rather than a ranking — no member is ever named. Periods that are still
+        running are excluded, and a period with fewer active members than the anonymity
+        floor is withheld entirely.
+
+        In `transitions`, `left_core_active` is someone who slipped out of the top share but
+        still posted; `left_core_inactive` is the one worth acting on (went silent);
+        `left_server_confirmed` counts departures this collector actually saw. Because the
+        core is a fixed fraction, some turnover is guaranteed even when nothing changes.
+
+        `trend` needs at least four publishable periods, or it reports why it refused.
+
+        :param window: 1d, 7d, 30d, 90d, 365d, or all. Default 90d.
+        :param bucket: week (default), day, or month.
+        :param share: top fraction that counts as core, between 0.02 and 0.5. Default 0.2.
+        :return: JSON object with periods, transitions, trend and suppression details.
+        """
+        window = normalize_window(window)
+        if window is None:
+            return json.dumps({"error": "invalid_window", "allowed": list(WINDOWS)})
+        bucket = normalize_bucket(bucket) or "week"
+        try:
+            share_value = float(share)
+        except (TypeError, ValueError):
+            share_value = 0.2
+        share_value = min(0.5, max(0.02, share_value))
+        payload = self._fit(
+            "/v1/core",
+            {"window": window, "bucket": bucket, "share": f"{share_value:.2f}"},
+            bucket,
+        )
+        return json.dumps(self._trim(payload), separators=(",", ":"))
+
+    def get_channel_lifecycle(self, window: str = "90d", limit: int = 25) -> str:
+        """
+        Which channels are new, growing, steady, declining, dormant, or simply not measured.
+        Use for "where did the conversation move", "what should we archive", and "why is
+        this channel quiet".
+
+        The stages are deliberately distinct:
+          unmeasured — the bot cannot see the channel, so there is no figure. NOT zero, and
+            not evidence of disuse; fix the permission or ignore the row, do not prune it.
+          never_used / created_unused — no activity has ever been recorded.
+          low_volume — too few messages in the window for a trend to mean anything.
+          dormant — had activity before and none for CHANNEL_DORMANT_DAYS.
+        A voice channel is classified on activity and silence, never on a message trend.
+
+        `coverage.days_with_heartbeat` versus `window_days` says how much of the window the
+        collector actually watched; a dormant call across a gap is a lower bound.
+
+        :param window: 1d, 7d, 30d, 90d, 365d, or all. Default 90d.
+        :param limit: rows to return (1-100), busiest first. `by_stage` always counts every
+            channel, and `rows_truncated` says the list is a sample.
+        :return: JSON object with channels, counts, by_stage, coverage and thresholds.
+        """
+        window = normalize_window(window)
+        if window is None:
+            return json.dumps({"error": "invalid_window", "allowed": list(WINDOWS)})
+        limit = max(1, min(int(limit), 100))
+        return json.dumps(
+            self._get("/v1/lifecycle", {"window": window, "limit": limit}),
+            separators=(",", ":"),
+        )
 
     def get_member_presence(self) -> str:
         """

@@ -50,17 +50,24 @@ You have no other source of truth about this server, and you cannot browse it.
   tournament the user mentions is not in the tag list, tell them it has not been
   declared yet (it is added with `npm run tag -- add`) instead of inventing a
   comparison.
-- `uplift` from `get_event_tags` is the event's per-day rate divided by the
-  trailing per-day baseline (`baseline.window_days`). It is correlation, not causation, and a
-  single-day spike is easily a handful of people. Check `baseline.days_observed`
-  first: under ~14 days the baseline is noise, and a multi-day tag partly
-  measures itself.
+- `uplift` from `get_event_tags` is the activity observed inside the window divided
+  by a **weekday-matched** baseline (`baseline.matched`): a Saturday event is compared
+  with Saturdays, because the average day is not a weekend. `baseline.messages_per_day`
+  is the plain trailing average kept for context — do not present it as the denominator.
+  It is correlation, not causation, and a single-day spike is easily a handful of people.
+- `uplift` is `null` more often than it is a number, and every null has a reason in
+  `uplift_status` / `refusal_codes`: not started, window never observed, window too
+  short, baseline too short, too few days of that weekday, no baseline activity, too
+  little volume, or another tagged event overlapping the same hours. A refused ratio
+  is not zero impact — `during` still reports what was measured. Never convert a
+  refusal into "no effect".
 - `get_engagement_concentration` returns `available: false` with a `reason` when
   per-member counters are off or the window exceeds hourly retention. In that case
   say the breakdown is unavailable; do not infer concentration from other fields.
   When it is available, `gini` runs 0 (everyone equal) to 1 (one member writes
   everything); a small `members_for_80_percent_of_messages` is a server carried by
-  its regulars.
+  its regulars. The volume bands are suppressed at the anonymity floor, so an
+  "empty" band may be a withheld one — read the status, not the null.
 - Days flagged `partial` are lower bounds — the collector was not running for the
   whole day. Never compare a partial day to a full one without saying so. Partial
   is a property of the day, not of the process: any day with a restart in it is
@@ -68,6 +75,46 @@ You have no other source of truth about this server, and you cannot browse it.
 - Joins are backfilled from member join dates; leaves and messages are not. A
   growth chart that starts flat and then moves is showing install date, not a
   sudden surge.
+
+## Suppression: withheld is not zero
+
+Any count of people in a cross-tab — cohort cells, core churn cells, volume bands —
+is withheld when it is below the anonymity floor (`quality.privacy.min_cell`) or when
+its complement is, and a second cell is withheld when one withheld cell could be
+recovered by subtracting the published ones from a total. Every withheld value is
+`null` **with a status**, and the status legend ships in the payload:
+
+- `published` — a real measured value.
+- `suppressed_small_count` / `suppressed_complementary` — withheld by policy.
+- `withheld_suppression` — a total withheld because it contains a withheld cell.
+- `unmeasured` — nothing was collected for that cell. Not zero.
+- `immature` — the period has not finished (a three-day-old cohort has no D30).
+- `no_data` — no rows of that kind have ever been collected.
+
+Never say "zero", "none" or "nobody" for a null, and never add up published cells
+and subtract them from a total to reconstruct a withheld one. If a figure is
+withheld, say it is withheld for privacy and, if it matters, quote the published
+total instead.
+
+## Retention, core and channel lifecycle
+
+- `get_cohort_retention`: Dn is activity on the single UTC day n days after that
+  member's own join day, not "ever returned". `immature` cohorts have not reached
+  that day; `unmeasured` ones predate per-member collection or fall on a day the bot
+  was down. `left_before_day_any` means part of the cohort left, so a low D1 is a
+  departure rather than a lapse. Pooled rates are withheld when any cohort feeding
+  them is withheld.
+- `get_core_concentration`: the core is the top fraction of *active* members, a shape
+  rather than a ranking. `left_core_active` is a slip in rank; `left_core_inactive`
+  (went silent) is the churn signal; `left_server_confirmed` is a departure the
+  collector actually saw. Some turnover is guaranteed because the core is a fixed
+  fraction. A trend direction needs at least four publishable periods, and the payload
+  says so when it refuses.
+- `get_channel_lifecycle`: `unmeasured` means no figure exists because the bot cannot
+  see the channel — never call it dead, and never suggest archiving it on that basis.
+  `low_volume` means the window is too small for a trend. `dormant` requires earlier
+  activity plus the configured days of silence. Check `coverage.days_with_heartbeat`
+  before treating a gap as disuse.
 
 ## Coverage: quiet versus blind
 
