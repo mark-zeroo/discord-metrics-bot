@@ -6,9 +6,13 @@ import {
   parseBucket,
   parseIntParam,
   maxTop,
+  parseEnum,
+  parsePeriods,
+  parseFraction,
   rejectUnknownParams,
 } from './params.js';
 import * as Q from './queries.js';
+import { retention, RETENTION_PERIODS } from './cohorts.js';
 
 // Both come from config (API_MAX_RESPONSE_KB / AUDIT_FLUSH_SECONDS); these are
 // only the values used when a caller builds the server without a config object.
@@ -110,6 +114,20 @@ export function createApiServer({ config, db, logger, collectors = null }) {
     'GET /v1/engagement': (params, ts) => {
       rejectUnknownParams(params, ['window']);
       return Q.engagement(db, config, { window: parseWindow(params), ts });
+    },
+
+    // Cohort retention. The window bounds which cohorts are *included*; each
+    // cohort's own Dn days are derived from its members' join dates, so a window
+    // that starts mid-cohort does not shift the measurement.
+    'GET /v1/retention': (params, ts) => {
+      rejectUnknownParams(params, ['window', 'cohort', 'periods', 'limit']);
+      return retention(db, config, {
+        window: parseWindow(params, '365d'),
+        cohort: parseEnum(params, 'cohort', ['week', 'day'], 'week'),
+        periods: parsePeriods(params, RETENTION_PERIODS, [1, 7, 30]),
+        limit: parseIntParam(params, 'limit', 12, 1, 52),
+        ts,
+      });
     },
 
     'GET /v1/events': (params, ts) => {

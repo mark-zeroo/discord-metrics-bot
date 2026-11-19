@@ -1,4 +1,4 @@
-import { DAY } from './time.js';
+import { DAY, dayOf } from './time.js';
 
 /**
  * Flush / prune / checkpoint.
@@ -42,10 +42,42 @@ export function createMaintenance({ db, config, collectors, bot, logger }) {
     }
   }
 
+  /**
+   * Mark that the collector was alive on this UTC day.
+   *
+   * Runs on the maintenance sweep (boot plus hourly), so a day on which the
+   * process ran at all gets a row. Retention reads it to decide whether a day with
+   * no activity was quiet or unobserved: without it, "nobody came back" and "the
+   * bot was down" are the same absence of rows.
+   */
+  function heartbeat(ts = now()) {
+    const day = dayOf(ts);
+    try {
+      db.run(
+        `INSERT INTO collector_day(day_ts, heartbeats, boots, first_ts, last_ts)
+         VALUES(?,1,1,?,?)
+         ON CONFLICT(day_ts) DO UPDATE SET
+           heartbeats = collector_day.heartbeats + 1,
+           last_ts = MAX(COALESCE(collector_day.last_ts, 0), excluded.last_ts)`,
+        day,
+        ts,
+        ts,
+      );
+    } catch (err) {
+      // A heartbeat is diagnostic. Spending the boot on it would be worse than
+      // losing one day's "we were up" flag.
+      logger?.warn?.('collector heartbeat failed', { error: err?.message ?? String(err) });
+    }
+  }
+
   function prune(ts = now()) {
     const hourlyCutoff = ts - config.storage.retentionHourlyDays * DAY;
     const dailyCutoff = ts - config.storage.retentionDailyDays * DAY;
     const auditCutoff = ts - config.storage.auditRetentionDays * DAY;
+
+    // Before the sweep, not after: a sweep that throws still leaves evidence the
+    // collector ran today.
+    heartbeat(ts);
 
     const removed = db.transaction(() => {
       let n = 0;
@@ -83,6 +115,7 @@ export function createMaintenance({ db, config, collectors, bot, logger }) {
       // rather than hourly: the whole point is a long historical headcount.
       del('DELETE FROM poster_day   WHERE day_ts < ?', dailyCutoff);
       del('DELETE FROM api_audit    WHERE ts < ?', auditCutoff);
+      del('DELETE FROM collector_day WHERE day_ts < ?', dailyCutoff);
       return n;
     });
 
@@ -110,6 +143,7 @@ export function createMaintenance({ db, config, collectors, bot, logger }) {
   return {
     flushAll,
     prune,
+    heartbeat,
 
     start() {
       flushTimer = setInterval(() => flushAll(), config.runtime.flushIntervalMs);

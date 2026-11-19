@@ -182,6 +182,22 @@ const SCHEMA = [
      UNIQUE (user_hmac, joined_ts)
    )`,
 
+  // Was the collector even running that day? A day with no activity and a day the
+  // process was down look identical in every activity table — both have no rows —
+  // and they mean opposite things. One heartbeat per day the collector was alive
+  // is enough to tell them apart, and it is the difference between "nobody came
+  // back" and "nobody was watching".
+  //
+  // No per-person data, no timestamps finer than the day: this says whether
+  // measurement happened, not who was measured.
+  `CREATE TABLE IF NOT EXISTS collector_day (
+     day_ts     INTEGER PRIMARY KEY,
+     heartbeats INTEGER NOT NULL DEFAULT 1,
+     boots      INTEGER NOT NULL DEFAULT 0,
+     first_ts   INTEGER,
+     last_ts    INTEGER
+   )`,
+
   `CREATE INDEX IF NOT EXISTS idx_member_day_hmac ON member_day(user_hmac, day_ts)`,
   `CREATE INDEX IF NOT EXISTS idx_member_tenure_hmac ON member_tenure(user_hmac)`,
   `CREATE INDEX IF NOT EXISTS idx_member_tenure_joined ON member_tenure(joined_ts)`,
