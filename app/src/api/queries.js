@@ -1573,10 +1573,6 @@ export function engagement(db, config, { window, ts = now() }) {
   };
 }
 
-function ratio(a, b) {
-  return b > 0 ? Number((a / b).toFixed(2)) : null;
-}
-
 /**
  * Operator-declared event windows, each expressed against a trailing baseline.
  *
@@ -1658,9 +1654,178 @@ function tagNotes({
   return notes.length ? notes.join(' ') : undefined;
 }
 
+const WEEKDAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+const weekdayOf = (ts) => new Date(ts * 1000).getUTCDay();
+
+/**
+ * Hours of [from, to) that fall on each UTC weekday, fractional at the edges.
+ *
+ * Matching by *hours* rather than by whole days is what makes a three-hour evening
+ * event comparable to a 24-hour baseline day: three Saturday-evening hours are
+ * 3/24 of a Saturday, not a whole one.
+ */
+function hoursByWeekday(from, to) {
+  const hours = new Array(7).fill(0);
+  for (let h = hourOf(from); h < to; h += HOUR) {
+    const start = Math.max(h, from);
+    const end = Math.min(h + HOUR, to);
+    if (end > start) hours[weekdayOf(h)] += (end - start) / HOUR;
+  }
+  return hours;
+}
+
+/**
+ * A weekday-matched baseline.
+ *
+ * The trailing average answers "how busy was this server per day" and is the wrong
+ * denominator for a weekend tournament: Saturday and Sunday are not average days,
+ * so a perfectly ordinary weekend event shows "uplift" that is really the weekly
+ * cycle. This walks every day of the baseline window, keeps the ones that were
+ * actually observed, and averages per weekday — so the comparison is Saturday
+ * against Saturdays.
+ *
+ * Days are enumerated from the calendar, not from the activity tables, so a
+ * baseline day with genuinely no messages counts as a zero rather than vanishing.
+ * A day the collector was down is excluded when heartbeats exist, because a down
+ * day is not a quiet day and counting it as zero inflates every uplift.
+ */
+function weekdayBaseline(db, { baseFrom, baseEnd, installDay, partialDays, notAfter = Infinity }) {
+  // A baseline cannot include a day that has not finished. An event tagged for next
+  // week has a baseline window that reaches into the future, and enumerating those
+  // days as zeroes dragged the mean down (35.7/day became 23.2/day) without any
+  // day having been observed at all.
+  const lastCompleteDay = dayOf(notAfter) - DAY;
+  const heartbeatDays = new Set(
+    db.all('SELECT day_ts FROM collector_day WHERE day_ts >= ? AND day_ts < ?', baseFrom, baseEnd)
+      .map((r) => r.day_ts),
+  );
+  const heartbeatsAvailable = heartbeatDays.size > 0;
+
+  const messagesByDay = new Map(
+    db
+      .all(
+        `SELECT day_ts, SUM(messages) AS v FROM message_day
+          WHERE day_ts >= ? AND day_ts < ? GROUP BY day_ts`,
+        baseFrom,
+        baseEnd,
+      )
+      .map((r) => [r.day_ts, r.v]),
+  );
+  const voiceByDay = new Map(
+    db
+      .all(
+        `SELECT day_ts, SUM(seconds) AS v FROM voice_day
+          WHERE day_ts >= ? AND day_ts < ? GROUP BY day_ts`,
+        baseFrom,
+        baseEnd,
+      )
+      .map((r) => [r.day_ts, r.v]),
+  );
+  const joinsByDay = new Map(
+    db
+      .all(
+        `SELECT day_ts, SUM(joins) AS v FROM growth_day
+          WHERE day_ts >= ? AND day_ts < ? GROUP BY day_ts`,
+        baseFrom,
+        baseEnd,
+      )
+      .map((r) => [r.day_ts, r.v]),
+  );
+
+  // Which days count as baseline days.
+  //
+  // With heartbeats, every finished day the collector was alive is a real day,
+  // including one with no activity: a quiet day is a zero and belongs in the mean.
+  //
+  // Without heartbeats — data collected before this table existed — a day with no
+  // rows is *unknown*, not zero. Counting those as zeros understates the baseline
+  // and therefore inflates every uplift, so the fallback only uses days that carry
+  // a recorded row. That can overstate the rate on a quiet server, which biases
+  // uplift down; understating an event's impact is the safer error.
+  const activityDays = new Set([
+    ...messagesByDay.keys(),
+    ...voiceByDay.keys(),
+    ...joinsByDay.keys(),
+  ]);
+  const usableDay = (d) =>
+    d >= installDay &&
+    d <= lastCompleteDay &&
+    !partialDays.has(d) &&
+    (heartbeatsAvailable ? heartbeatDays.has(d) : activityDays.has(d));
+
+  const days = [];
+  for (let d = dayOf(baseFrom); d < baseEnd; d += DAY) {
+    if (usableDay(d)) days.push(d);
+  }
+
+  const sums = {
+    messages: new Array(7).fill(0),
+    voice: new Array(7).fill(0),
+    joins: new Array(7).fill(0),
+  };
+  const counts = new Array(7).fill(0);
+  let totalMessages = 0;
+  let totalVoice = 0;
+  let totalJoins = 0;
+
+  for (const d of days) {
+    const dow = weekdayOf(d);
+    const m = messagesByDay.get(d) ?? 0;
+    const v = voiceByDay.get(d) ?? 0;
+    const j = joinsByDay.get(d) ?? 0;
+    sums.messages[dow] += m;
+    sums.voice[dow] += v;
+    sums.joins[dow] += j;
+    counts[dow] += 1;
+    totalMessages += m;
+    totalVoice += v;
+    totalJoins += j;
+  }
+
+  const mean = (arr, dow) => (counts[dow] > 0 ? arr[dow] / counts[dow] : null);
+  return {
+    days_used: days.length,
+    days_by_weekday: Object.fromEntries(WEEKDAY_NAMES.map((name, i) => [name, counts[i]])),
+    messages_per_day_by_weekday: Object.fromEntries(
+      WEEKDAY_NAMES.map((name, i) => [name, mean(sums.messages, i)]),
+    ),
+    mean_messages_per_day: days.length > 0 ? totalMessages / days.length : null,
+    mean_voice_hours_per_day: days.length > 0 ? totalVoice / 3600 / days.length : null,
+    mean_joins_per_day: days.length > 0 ? totalJoins / days.length : null,
+    sums,
+    counts,
+    heartbeats_available: heartbeatsAvailable,
+  };
+}
+
+/**
+ * Expected activity for a window, given hours per weekday and a matched baseline.
+ *
+ * Returns null for a metric when any weekday the window touches has too few
+ * baseline days to average: a mean over two Saturdays is not a baseline, and
+ * silently using it is how a lucky weekend becomes a 3x "uplift".
+ */
+function expectation(hours, matched, key, minDays) {
+  const thin = [];
+  let expected = 0;
+  for (let dow = 0; dow < 7; dow += 1) {
+    if (hours[dow] <= 0) continue;
+    if (matched.counts[dow] < minDays) {
+      thin.push(WEEKDAY_NAMES[dow]);
+      continue;
+    }
+    expected += (hours[dow] / 24) * (matched.sums[key][dow] / matched.counts[dow]);
+  }
+  if (thin.length > 0) return { thin };
+  return { expected };
+}
+
 function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
   const baselineDays = config.analytics.eventBaselineDays;
   const noisyDays = config.analytics.eventBaselineNoisyDays;
+  const minMessages = config.analytics.eventUpliftMinMessages;
+  const minMatchedDays = config.analytics.eventMatchedMinDays;
   const start = tag.start_ts;
   const end = Math.max(tag.end_ts, tag.start_ts + HOUR);
   const endBounded = Math.min(end, ts);
@@ -1782,6 +1947,151 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
   // near-zero activity read as a failed event.
   const status = ts < start ? 'upcoming' : ts < end ? 'ongoing' : 'past';
 
+  // ------------------------------------------------- matched baseline + uplift
+  const partialDays = new Set(
+    db
+      .all(
+        `SELECT day_ts FROM message_day WHERE partial = 1 AND day_ts >= ? AND day_ts < ?
+         UNION SELECT day_ts FROM voice_day WHERE partial = 1 AND day_ts >= ? AND day_ts < ?`,
+        baseFrom,
+        baseEnd,
+        baseFrom,
+        baseEnd,
+      )
+      .map((r) => r.day_ts),
+  );
+  const matched = weekdayBaseline(db, {
+    baseFrom,
+    baseEnd,
+    installDay: install === null ? -Infinity : dayOf(install),
+    partialDays,
+    notAfter: ts,
+  });
+  const hours = observable ? hoursByWeekday(seenFrom, seenTo) : new Array(7).fill(0);
+
+  // Two tagged events in the same hours cannot be told apart: the uplift of one is
+  // partly the other. Refusing is the only honest answer.
+  const overlaps = db.all(
+    `SELECT id, name, start_ts, end_ts FROM event_tag
+      WHERE id <> ? AND start_ts < ? AND end_ts > ?`,
+    tag.id,
+    end,
+    start,
+  );
+
+  const refused = [];
+  const upliftStatus = (metric, code, detail, remedy) => {
+    refused.push({ metric, code, detail, remedy: remedy ?? null });
+    return { status: 'refused', code, value: null };
+  };
+
+  const blocked = (() => {
+    if (status === 'upcoming') {
+      return ['not_started', 'The event has not started, so there is no window to measure.'];
+    }
+    if (!observable) {
+      return [
+        'window_unobserved',
+        'The event ended before collection began, so no message or voice row covers it.',
+      ];
+    }
+    if (!ratesMeaningful) {
+      return [
+        'window_too_short',
+        `Only ${Number(seenHoursExact.toFixed(1))} hours of the window have been observed; a ` +
+          'per-day rate needs at least six.',
+      ];
+    }
+    if (overlaps.length > 0) {
+      return [
+        'overlapping_event',
+        `Another tagged window overlaps this one (${overlaps
+          .map((o) => `#${o.id}`)
+          .join(', ')}), so activity cannot be attributed to either.`,
+      ];
+    }
+    if (!baselineMeasurable) {
+      return [
+        'baseline_unmeasurable',
+        'Less than a day of the baseline window has been collected, and a partial day cannot ' +
+          'stand in for a per-day rate.',
+      ];
+    }
+    if ((baseMsg?.days ?? 0) < noisyDays) {
+      return [
+        'baseline_too_short',
+        `Only ${baseMsg?.days ?? 0} baseline days have activity; ` +
+          `EVENT_BASELINE_NOISY_DAYS asks for ${noisyDays} before a ratio is quoted.`,
+      ];
+    }
+    return null;
+  })();
+
+  const uplift = {};
+  const upliftStatusMap = {};
+  let publishedAny = false;
+
+  const metrics = [
+    {
+      key: 'messages',
+      actual: messagesDuring,
+      hours,
+      minVolume: minMessages,
+      format: (v) => Number(v.toFixed(2)),
+    },
+    { key: 'voice', actual: secondsDuring / 3600, hours, minVolume: 0, format: (v) => Number(v.toFixed(2)) },
+    { key: 'joins', actual: joinsDuring, hours, minVolume: 0, format: (v) => Number(v.toFixed(2)) },
+  ];
+
+  for (const metric of metrics) {
+    if (blocked) {
+      uplift[metric.key] = null;
+      upliftStatusMap[metric.key] = { status: 'refused', code: blocked[0] };
+      continue;
+    }
+    const exp = expectation(metric.hours, matched, metric.key, minMatchedDays);
+    if (exp.thin) {
+      uplift[metric.key] = null;
+      upliftStatusMap[metric.key] = {
+        status: 'refused',
+        code: 'matched_baseline_thin',
+        detail: `Not enough baseline days for ${exp.thin.join(', ')} (${minMatchedDays} needed per weekday).`,
+      };
+      continue;
+    }
+    if (exp.expected <= 0) {
+      uplift[metric.key] = null;
+      upliftStatusMap[metric.key] = {
+        status: 'refused',
+        code: 'no_baseline_activity',
+        detail: 'The matched baseline predicts no activity in this window, so a ratio is undefined.',
+      };
+      continue;
+    }
+    if (metric.minVolume > 0 && metric.actual < metric.minVolume) {
+      uplift[metric.key] = null;
+      upliftStatusMap[metric.key] = {
+        status: 'refused',
+        code: 'insufficient_volume',
+        detail: `${metric.actual} in the window is below EVENT_UPLIFT_MIN_MESSAGES=${metric.minVolume}.`,
+      };
+      continue;
+    }
+    uplift[metric.key] = metric.format(metric.actual / exp.expected);
+    upliftStatusMap[metric.key] = {
+      status: 'published',
+      basis: 'weekday_matched',
+      expected: Number(exp.expected.toFixed(2)),
+    };
+    publishedAny = true;
+  }
+
+  const refusalCodes = [...new Set(refused.map((r) => r.code).concat(
+    Object.values(upliftStatusMap)
+      .filter((s) => s.status === 'refused')
+      .map((s) => s.code),
+  ))];
+
   return {
     id: tag.id,
     name: safeLabel(tag.name),
@@ -1832,24 +2142,42 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
       // Unclamped: a baseline that predates collection is covered by 0 days, and
       // a 1 here contradicted days_observed: 0 while the rates divided by 1.
       days_covered: Number(coveredDays.toFixed(2)),
+      // The uplift denominator. Trailing averages are kept above for context and
+      // comparability; these are what the ratio actually divides by.
+      matched: {
+        method: 'weekday_matched',
+        days_used: matched.days_used,
+        days_by_weekday: matched.days_by_weekday,
+        messages_per_day_by_weekday: matched.messages_per_day_by_weekday,
+        mean_messages_per_day:
+          matched.mean_messages_per_day === null
+            ? null
+            : Number(matched.mean_messages_per_day.toFixed(1)),
+        mean_voice_hours_per_day:
+          matched.mean_voice_hours_per_day === null
+            ? null
+            : Number(matched.mean_voice_hours_per_day.toFixed(2)),
+        mean_joins_per_day:
+          matched.mean_joins_per_day === null ? null : Number(matched.mean_joins_per_day.toFixed(2)),
+        min_days_per_weekday: minMatchedDays,
+        heartbeats_available: matched.heartbeats_available,
+        note: matched.heartbeats_available
+          ? 'Baseline days with a known collection gap are excluded; a day the collector was ' +
+            'down is not a quiet day, and counting it as zero inflates uplift.'
+          : 'No heartbeats were recorded for this window (data predates collector_day), so only ' +
+            'days with a recorded row are used. Counting unobserved days as zeros would ' +
+            'understate the baseline and inflate uplift.'
+      },
     },
     // No baseline rows at all means the ratio would divide by zero and read as a
     // confident "no impact". Say null instead and explain why.
-    uplift:
-      status === 'upcoming' ||
-      !baselineMeasurable ||
-      !ratesMeaningful ||
-      (baseMsg?.days ?? 0) === 0 ||
-      baseMessagesPerDay === 0
-        ? null
-        : {
-            messages: ratio(messagesPerDay, baseMessagesPerDay),
-            voice: ratio(voiceHoursPerDay, baseVoicePerDay),
-            joins: ratio(
-              seenSpanDays > 0 ? joinsDuring / seenSpanDays : null,
-              baseJoinsPerDay,
-            ),
-          },
+    uplift: publishedAny ? uplift : null,
+    uplift_status: upliftStatusMap,
+    refusal_codes: refusalCodes,
+    refusals: refused,
+    overlapping_events: overlaps.length
+      ? overlaps.map((o) => ({ id: o.id, name: safeLabel(o.name) }))
+      : [],
     note: tagNotes({
       status,
       observable,
@@ -1885,8 +2213,18 @@ export function tags(db, config, { limit = 20, ts = now() } = {}) {
     order: 'newest first (start_ts desc); raise limit to see older tags',
     caveats: [
       'Tags are declared by an operator with the tag CLI, not inferred from Discord. Nothing is tagged until someone adds it.',
-      `uplift divides the window per-day rate by the trailing ${config.analytics.eventBaselineDays}-day per-day baseline. It is correlation, not proof of cause.`,
-      `A baseline with fewer than ${config.analytics.eventBaselineNoisyDays} days observed is noisy; check baseline.days_observed before quoting it.`,
+      `uplift divides the activity observed inside the window by a weekday-matched baseline built from the ` +
+        `trailing ${config.analytics.eventBaselineDays} days: a Saturday event is compared with Saturdays, ` +
+        'because the average day is not a weekend. It is correlation, not proof of cause.',
+      `baseline.messages_per_day is the plain trailing average, kept for context; baseline.matched is the ` +
+        'denominator uplift actually uses. The two differ on any server with a weekly rhythm, and quoting ' +
+        'the first as if it were the second overstates weekend events.',
+      `A baseline with fewer than ${config.analytics.eventBaselineNoisyDays} days observed is refused ` +
+        'rather than quoted with a warning: an uplift derived from a week of history does not survive ' +
+        'a second look.',
+      'A refusal is not a zero. uplift_status says per metric whether the figure was published or ' +
+        'refused, refusal_codes lists why, and during still reports what was measured.',
+      'Two overlapping tagged windows cannot be attributed, so they refuse uplift and name each other.',
     ],
     quality: quality(db, config, ts),
   };
