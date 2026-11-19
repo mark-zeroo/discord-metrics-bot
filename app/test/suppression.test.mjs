@@ -6,7 +6,6 @@ import {
   STATUS_LEGEND,
   countCell,
   isPublished,
-  pooledCell,
   ratioCell,
   suppressPartition,
   suppressionBlock,
@@ -149,16 +148,6 @@ test('suppression of a partition never exposes a single cell', () => {
   // The branch stays as a guard for callers that pass a partition of the wrong total.
   const partitionOfFive = suppressPartition({ k: K, counts: [{ key: 'a', count: 5 }, { key: 'b', count: 0 }] });
   assert.equal(partitionOfFive.protected, true);
-});
-
-test('pooled totals are withheld when any contributing row is withheld', () => {
-  const publishedCell = { status: STATUS.published, value: 4 };
-  const withheldCell = { status: STATUS.suppressed_small_count, value: null };
-  assert.equal(pooledCell(0.2, [publishedCell]).value, 0.2);
-  const pooled = pooledCell(0.2, [publishedCell, withheldCell]);
-  assert.equal(pooled.value, null);
-  assert.equal(pooled.status, STATUS.withheld_suppression);
-  assert.equal(pooled.withheld_inputs, 1);
 });
 
 test('the suppression block counts statuses and states the policy', () => {

@@ -4,7 +4,6 @@ import {
   STATUS_LEGEND,
   countCell,
   isPublished,
-  pooledCell,
   ratioCell,
   suppressionBlock,
   withheld,
@@ -283,32 +282,58 @@ export function retention(
     return entry;
   });
 
-  // Pooled rates: an average over cohorts. Published only when every cohort
-  // published the same cell, because the total minus the published cohorts is the
-  // withheld one.
+  // Pooled rates: an average over the cohorts that published this period.
+  //
+  // Deliberately *only* the published ones. A pooled figure computed over a
+  // withheld cohort would recover it by subtraction, but a pooled figure over the
+  // published cohorts recovers nothing: it is already derivable from them. The
+  // count of cohorts left out travels with the number so a narrow pool is never
+  // mistaken for the whole history.
   const pooled = {};
   for (const p of periods) {
     const label = PERIOD_LABEL(p);
-    let active = 0;
-    let denom = 0;
+    const included = cohorts.filter((c) => c[label] && c[label].status === STATUS.published);
+    const excluded = cohorts.length - included.length;
+    // Why a cohort is out of the pool matters: "immature" resolves next month and
+    // "suppressed" never does. Folding them into one count would make a young
+    // table look like a heavily censored one.
+    const excludedByStatus = {};
     for (const c of cohorts) {
-      if (isPublished(c[label] ? { status: c[label].status } : null)) {
-        active += c[label].retained;
-        denom += c[label].measured;
-      }
+      const status = c[label]?.status ?? STATUS.no_data;
+      if (status === STATUS.published) continue;
+      excludedByStatus[status] = (excludedByStatus[status] ?? 0) + 1;
     }
-    const rowCells = cohorts.map((c) => c[label]).filter(Boolean);
-    const pooledRate = pooledCell(denom > 0 ? active / denom : NaN, rowCells);
-    pooled[label] = {
-      status: pooledRate.status,
-      rate: pooledRate.value,
-      // The inputs are counts of people, so they follow the same floor. When the
-      // rate is withheld because a cohort is withheld, the inputs would recover it.
-      retained: pooledRate.status === STATUS.published ? active : null,
-      measured: pooledRate.status === STATUS.published ? denom : null,
-      cohorts_included:
-        pooledRate.status === STATUS.published ? rowCells.length : null,
-    };
+    let retained = 0;
+    let measured = 0;
+    for (const c of included) {
+      retained += c[label].retained;
+      measured += c[label].measured;
+    }
+
+    if (included.length === 0 || measured === 0) {
+      pooled[label] = {
+        status: STATUS.withheld_suppression,
+        rate: null,
+        retained: null,
+        measured: null,
+        cohorts_included: 0,
+        cohorts_excluded: excluded,
+        excluded_by_status: excludedByStatus,
+        reason:
+          'every cohort for this period is withheld or unmeasurable, so there is nothing to pool ' +
+          'without republishing a withheld cell',
+      };
+    } else {
+      pooled[label] = {
+        status: STATUS.published,
+        rate: Number((retained / measured).toFixed(3)),
+        retained,
+        measured,
+        cohorts_included: included.length,
+        cohorts_excluded: excluded,
+        excluded_by_status: excludedByStatus,
+      };
+    }
   }
 
   return {
@@ -333,6 +358,10 @@ export function retention(
       activity_source: 'member_day (per-member, daily, hmac mode only)',
       activity_from: activityFrom === null ? null : isoDate(activityFrom),
       last_complete_day: isoDate(lastCompleteDay),
+      pooled:
+        'pooled rates cover only the cohorts that published that period (cohorts_included) and ' +
+        'say how many were left out (cohorts_excluded); a total over a withheld cohort would ' +
+        'recover it by subtraction.',
     },
     suppression: suppressionBlock({ k, cells }),
     status_legend: legend,

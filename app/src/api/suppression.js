@@ -19,10 +19,11 @@
  *    published non-zero one) is withheld too. Two unknowns and one equation is
  *    the standard answer, and it is the only one that keeps the total publishable.
  *
- * 3. Totals that cannot be protected that way are withheld. If a pooled rate is
- *    computed over cohorts that include a withheld one, the pooled figure plus the
- *    published cohorts recovers the withheld one; there is no second cell to
- *    sacrifice, so the total is reported as withheld instead of as a number.
+ * 3. A total is only published over rows that themselves published. A pooled
+ *    figure that includes a withheld row recovers that row by subtraction, and
+ *    there is no second cell to sacrifice at that level. Pooling over the
+ *    published rows instead is safe (the result is already derivable from them) as
+ *    long as the payload says how many rows were left out.
  *
  * Every withheld value is a *status*, never a bare null. A null with no status is
  * indistinguishable from "this server was quiet" and from "collection had not
@@ -194,24 +195,6 @@ export function suppressPartition({ counts, k, total = null }) {
     total: totalExposed ? withheld(STATUS.withheld_suppression) : published(base),
     protected: !totalExposed,
   };
-}
-
-/**
- * A pooled figure that spans rows which may be withheld.
- *
- * Returns published only when every contributing row published the same metric: a
- * total over a table with a gap in it is a subtraction away from the gap. This is
- * rule 3, and it is deliberately blunt — a withheld pooled rate is a smaller loss
- * than a k-floor that does not hold.
- */
-export function pooledCell(value, rowCells, digits = 3) {
-  if (rowCells.length === 0) return withheld(STATUS.no_data);
-  const gaps = rowCells.filter((c) => !isPublished(c)).length;
-  if (gaps > 0) {
-    return withheld(STATUS.withheld_suppression, { withheld_inputs: gaps });
-  }
-  if (!Number.isFinite(value)) return withheld(STATUS.unmeasured);
-  return published(Number(value.toFixed(digits)));
 }
 
 /**

@@ -169,18 +169,40 @@ test('a retention count whose complement is tiny is withheld as well', () => {
   assert.equal(c.d1.status, STATUS.suppressed_small_count);
 });
 
-test('a pooled rate is withheld when any cohort feeding it is withheld', () => {
+test('a pooled rate covers only the cohorts that published, and says how many it skipped', () => {
   const db = openDb(':memory:');
   heartbeats(db, day(42), TODAY);
   // One publishable cohort, one below the floor.
-  cohort(db, { prefix: 'p', joinDay: day(40), size: 30, active: { 1: range(0, 14) } });
+  cohort(db, { prefix: 'p', joinDay: day(40), size: 40, active: { 1: range(0, 19) } });
   cohort(db, { prefix: 'q', joinDay: day(10), size: 6, active: { 1: range(0, 4) } });
 
   const out = retention(db, cfg(), { window: window365, cohort: 'day', periods: [1], ts: TS });
   assert.equal(out.cohorts.length, 2);
+  const pooled = out.pooled.d1;
+  assert.equal(pooled.status, STATUS.published);
+  // Only the 40-member cohort is in it: 20 retained of 40. The withheld cohort
+  // contributes nothing, which is what stops the pool from recovering it.
+  assert.equal(pooled.retained, 20);
+  assert.equal(pooled.measured, 40);
+  assert.equal(pooled.rate, 0.5);
+  assert.equal(pooled.cohorts_included, 1);
+  assert.equal(pooled.cohorts_excluded, 1);
+  // The reason a cohort is out of the pool is broken down: withheld and immature
+  // are different futures.
+  assert.deepEqual(pooled.excluded_by_status, { suppressed_small_count: 1 });
+  assert.match(out.basis.pooled, /cohorts_included/);
+});
+
+test('a pooled rate is withheld when no cohort published', () => {
+  const db = openDb(':memory:');
+  heartbeats(db, day(12), TODAY);
+  cohort(db, { prefix: 's', joinDay: day(10), size: 6, active: { 1: range(0, 4) } });
+
+  const out = retention(db, cfg(), { window: window365, cohort: 'day', periods: [1], ts: TS });
   assert.equal(out.pooled.d1.status, STATUS.withheld_suppression);
   assert.equal(out.pooled.d1.rate, null);
-  assert.equal(out.pooled.d1.retained, null);
+  assert.equal(out.pooled.d1.cohorts_included, 0);
+  assert.match(out.pooled.d1.reason, /nothing to pool/);
 });
 
 test('a pooled rate publishes when every cohort publishes', () => {
