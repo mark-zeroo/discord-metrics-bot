@@ -607,6 +607,9 @@ Aggregates only. Two resolutions, so long-range retention stays cheap:
 | `guild_event` | Discord scheduled event | name, times, subscriber count |
 | `event_tag` | operator-declared window | name, kind, prize, participants, notes |
 | `member_hour` | hour × pseudonym | opt-in only, `PER_MEMBER_COUNTERS=hmac` |
+| `member_day` | day × pseudonym | opt-in only; one row per active member per active day, for retention |
+| `member_tenure` | membership span | pseudonym + join/leave time, one row per span (a rejoin is a new span) |
+| `collector_day` | day | heartbeat: did the process run that day. No per-person data |
 | `channel_meta`, `role_meta` | current state | channels and roles as last observed, `deleted_ts` marks removals instead of deleting rows |
 | `structure_change` | change event | channel, role and guild changes, plus one `structure_baseline` row at install |
 | `api_audit` | per request | token id, route, query string, status, duration, peer IP |
@@ -640,6 +643,79 @@ unknowable. A graceful shutdown flushes before exiting, so the only loss is a
 Retention (`RETENTION_HOURLY_DAYS=90`, `RETENTION_DAILY_DAYS=730`) is enforced by a
 periodic sweep that runs `VACUUM` afterwards, on `MAINTENANCE_INTERVAL_MINUTES`. Daily
 rollups outlive hourly ones on purpose: dropping hours loses drill-down, not history.
+
+---
+
+## Retention, the core, and the anonymous floor
+
+Three questions this bot could not answer from totals, and the data each one needed:
+
+**Cohort retention** (`/v1/retention`). Of the members who joined in a given week, what
+share was still active 1, 7 or 30 days later? That needs two things the collector did not
+keep: per-member activity at a *day* grain, which outlives the hourly sweep
+(`member_day`), and the join date of a specific member (`member_tenure`). A membership
+is stored as a span, so someone who leaves and rejoins is a new cohort rather than an
+edit of the old one — otherwise the rejoin would inherit the previous membership's day-1
+activity and invent retention that never happened.
+
+`Dn` means active on the single UTC day that is n days after *that member's* join day.
+Not "returned at some point after day n". The distinction is stated in the payload
+because both definitions are called retention in the wild.
+
+Three states are kept apart, and each one would otherwise be a zero:
+
+| Cell status | Means | Resolves with time? |
+|---|---|---|
+| `immature` | the day has not happened yet for this cohort | yes |
+| `unmeasured` | the day predates `member_day`, or the collector has no heartbeat for it | no |
+| `suppressed_small_count` | withheld by the anonymity floor below | no |
+
+**Core concentration and core churn** (`/v1/core`). The core is the top `CORE_SHARE`
+(20%) of active members by messages in each complete period. Periods still running are
+excluded, because a half-finished week reads as a collapse every Monday. Churn between
+two periods is split four ways — stayed, slipped out of the top share but still posting,
+went silent, and confirmed departure — because a fixed-size core guarantees some
+turnover even when nobody changes behaviour, and only "went silent" is a signal. No
+endpoint ever returns a ranking: the size of the core and its shape are published, the
+members in it are not.
+
+**Channel lifecycle** (`/v1/lifecycle`). Each channel is classified as new, growing,
+steady, declining, dormant, low volume, never used, created-unused, removed, or
+*unmeasured*. The last one matters most: a channel the bot cannot see has no figure at
+all, and reporting 0 would both hide a coverage gap and libel a live channel. Dormant
+requires earlier activity plus `CHANNEL_DORMANT_DAYS` of silence; below
+`CHANNEL_MIN_MESSAGES` a channel is `low_volume` rather than "declining". Creation dates
+come from recorded structure changes, so a channel that predates install has
+`created: null` and is classified from observed activity instead.
+
+### The anonymous floor
+
+Every per-person cross-tab goes through one guard (`app/src/api/suppression.js`) before
+it is published, because "3 of the 4 people who joined that week came back on day 1"
+names the one who did not, to anyone who knows who joined that week.
+
+- **k-floor.** A count of people below `PRIVACY_MIN_CELL` (10) is withheld — and so is a
+  count whose *complement* within its group is below it. 19 of 20 retained is as
+  identifying as 1 of 20.
+- **Complementary suppression.** Withholding one cell from a table that adds up to a
+  published total does not hide it, because the reader subtracts. When one withheld cell
+  would be recoverable, a second (the smallest published non-zero one) is withheld too.
+  Two unknowns and one equation is the standard answer and the only one that keeps the
+  total publishable.
+- **Totals that cannot be protected that way are withheld.** A pooled retention rate that
+  spans a withheld cohort is reported as `withheld_suppression`, not as a number.
+- **A refused ratio is not zero.** Event uplift refuses rather than quotes when the
+  baseline or the window cannot support it (see below).
+
+**Silence is distinguishable from suppression.** Every withheld value is `null` *with a
+status* — `suppressed_small_count`, `suppressed_complementary`, `withheld_suppression`,
+`unmeasured`, `immature`, `no_data` — and the legend ships inside the payload and in
+`/v1/meta`'s `status_vocabulary`. A bare null is ambiguous between "we measured zero",
+"we hid it" and "we never collected it", and telling those apart is the whole point.
+
+What the floor does **not** do: it does not suppress totals (`/v1/summary` still reports
+members, messages, posters), and it cannot protect against an operator who reads the
+database directly. It guards what the API hands to a model.
 
 ---
 
@@ -759,11 +835,21 @@ explicit offset
 covers the whole of that day, end-exclusive. Assuming UTC silently is how a 3:30pm
 event gets stored at 08:30Z and compared against the wrong hours of activity.
 
-`/v1/tags` then reports, per window, the activity inside it and an uplift against
-the trailing `EVENT_BASELINE_DAYS` (28) per-day baseline, plus a `baseline_noisy`
-flag when the busiest baseline day exceeds `EVENT_BASELINE_NOISY_DAYS` × the median
-— because a server with one weekly game night will show a fake spike for anything
-compared against it.
+`/v1/tags` then reports, per window, the activity inside it and an uplift against a
+**weekday-matched** baseline built from the trailing `EVENT_BASELINE_DAYS` (28) days.
+Matching by weekday, weighted by how many hours of the window fall on each one, is what
+stops a Saturday tournament from "gaining" 80% purely because it ran on a weekend: the
+trailing average of a server with a weekly rhythm is not a fair denominator, and it is
+kept in `baseline.messages_per_day` only for context.
+
+Uplift refuses rather than qualifies when a ratio would not survive a second look:
+not started, window never observed, window under six observed hours, baseline under a
+day, baseline under `EVENT_BASELINE_NOISY_DAYS` of activity, fewer than
+`EVENT_MATCHED_MIN_DAYS` baseline days for a weekday the event touches, no baseline
+activity to divide by, an event window below `EVENT_UPLIFT_MIN_MESSAGES`, or another
+tagged window overlapping the same hours. Each refusal carries a code, the measured
+activity is still reported, and `uplift` is `null` only when nothing at all is
+publishable — so a refusal never reads as "no impact".
 
 ---
 
@@ -857,7 +943,10 @@ that tries to smuggle `&sql=` fails loudly.
 | `/v1/growth` | `window`, `bucket` | joins, leaves, net growth over time, tenure of current members (shares divide by today's headcount in `tenure.total_members`; `tenure.members_at_install` keeps the install-day figure for context) |
 | `/v1/activity` | `window`, `bucket`, `top` | message/voice series over time, busiest channels |
 | `/v1/voice` | `window`, `bucket`, `top` | voice minutes over time, busiest channels; `voice_count_mode` says whether the series was collected under `present` or `unmuted`, because a total means different things in each |
-| `/v1/tags` | `limit` | tagged event windows with in-window activity and uplift vs baseline |
+| `/v1/tags` | `limit` | tagged event windows with in-window activity and uplift against a weekday-matched baseline, plus per-metric refusal codes |
+| `/v1/retention` | `window`, `cohort`, `periods`, `limit` | join-cohort retention at D1/D7/D30 with maturity, coverage and suppression statuses |
+| `/v1/core` | `window`, `bucket`, `share` | concentration of messaging among regulars over complete periods, plus core churn between them |
+| `/v1/lifecycle` | `window`, `limit` | per-channel lifecycle stage, trend, coverage of the window, and unmeasured channels |
 | `/v1/engagement` | `window` | concentration: how many members produce 80% of messages, top-10% share, Gini, active-to-lurker ratio (requires `PER_MEMBER_COUNTERS=hmac`) |
 | `/v1/events` | — | Discord scheduled events and observed turnout |
 | `/v1/presence` | — | point-in-time online count and ratio |
@@ -872,7 +961,10 @@ Enumerations and limits — everything the caller can influence:
 | `bucket` | `hour`, `day`, `week`, `month`; `hour` only for windows ≤ 7d; default `day` |
 | `top` | integer `1`–`API_MAX_TOP` (10); anything else is a `400`, not a clamp |
 | `detail` | `summary` or `full`; `full` adds per-channel and per-role rows, the uncategorised list, and a longer change history; default `summary` |
-| `limit` | integer `1`–50; anything else is a `400` |
+| `limit` | integer `1`–50 (`/v1/retention`, `/v1/tags`) or `1`–100 (`/v1/lifecycle`); anything else is a `400` |
+| `cohort` | `week` or `day` — the bucket joiners are grouped into; default `week` |
+| `periods` | comma-separated day counts drawn from `1,7,14,30`; default `1,7,30` |
+| `share` | decimal fraction `0.02`–`0.5` for the core size; `20` is a `400`, because it could mean 20% or twenty times |
 
 Errors are shaped the same everywhere, so a model can recover:
 
@@ -979,7 +1071,8 @@ Notes on the policy, because two of them are deliberate rather than obvious:
 | `AUDIT_RETENTION_DAYS` | `30` | audit rows kept |
 | `READY_TIMEOUT_SECONDS` | `60` | fail fast instead of looking alive without collecting |
 | `PER_CHANNEL_METRICS` | `true` | per-channel rows (off = one total row per bucket) |
-| `PER_MEMBER_COUNTERS` | `off` | `off` or `hmac`; `hmac` requires `HMAC_KEY` (≥32 bytes) |
+| `PER_MEMBER_COUNTERS` | `off` | `off` or `hmac`; `hmac` requires `HMAC_KEY` (≥32 bytes). Retention, core analysis and the engagement breakdown need `hmac`: they are unavailable, with a reason, when it is off |
+| `PRIVACY_MIN_CELL` | `10` | the anonymity floor k for any published cross-tab of people; cells below it, and cells whose complement is below it, are withheld |
 | `EXCLUDED_ROLE_IDS` | — | comma-separated role IDs whose messages are ignored |
 | `VOICE_COUNT_MODE` | `present` | `present` counts muted members sitting in a channel; `unmuted` requires an unmuted, undeafened member |
 
@@ -991,8 +1084,14 @@ That is deliberate — it is the map every other figure is read against.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EVENT_BASELINE_DAYS` | `28` | trailing baseline length for event uplift |
-| `EVENT_BASELINE_NOISY_DAYS` | `3` | spike ratio at which the baseline is flagged noisy |
+| `EVENT_BASELINE_DAYS` | `28` | trailing baseline length for event uplift; long enough to hold several of each weekday |
+| `EVENT_BASELINE_NOISY_DAYS` | `14` | baseline days of activity required before an uplift is quoted at all |
+| `EVENT_MATCHED_MIN_DAYS` | `3` | baseline days per weekday required before the matched baseline is trusted |
+| `EVENT_UPLIFT_MIN_MESSAGES` | `30` | refuse a message uplift below this many messages in the window |
+| `CORE_SHARE` | `0.2` | fraction of active members that counts as the core (`0.02`–`0.5`) |
+| `CORE_PERIODS` | `8` | complete periods the core trend looks back over |
+| `CHANNEL_DORMANT_DAYS` | `21` | silence before a previously active channel is dormant |
+| `CHANNEL_MIN_MESSAGES` | `20` | messages needed in the window before a growing/declining call |
 
 ### API
 
@@ -1287,6 +1386,8 @@ the fastest way to notice it again.
 | Lateral movement inside a VPC | optional `API_ALLOWED_IPS` allowlist (exact IP or CIDR, IPv4-mapped IPv6 normalised) | `app/src/api/auth.js` |
 | Unbounded load from a looping model | per-token sliding-window rate limit, `429` + `Retry-After` | `app/src/api/server.js` |
 | Silent misuse | every request appended to `api_audit`, pruned at 30d | `app/src/api/server.js` |
+| Re-identification from aggregates | k-floor plus complementary suppression on every per-person cross-tab; withheld values carry a status | `app/src/api/suppression.js` |
+| Per-member history outliving its policy | `member_hour` pruned at hourly retention, `member_day` at daily retention, closed spans at daily retention | `app/src/maintenance.js` |
 | Browser-side leakage | `no-store`, `nosniff`, `CSP: default-src 'none'`, `no-referrer` | `app/src/api/server.js` |
 | Response splitting | header values stripped of CR/LF before use | `app/src/api/server.js` |
 | Supply chain | `npm ci --ignore-scripts`, exact pins, committed lockfile | `Dockerfile`, `app/.npmrc` |
@@ -1307,7 +1408,7 @@ anyway.
 
 ```bash
 cd app                       # the Node project; every npm command lives here
-npm test                     # 205 tests, node:test, no test framework needed
+npm test                     # 282 tests, node:test, no test framework needed
 npm test -- --test-name-pattern restart
 node --test test/repair.test.mjs
 ```
@@ -1406,6 +1507,18 @@ and anything that changes stored history gets a test that pins the arithmetic (s
 - **Voice before the first boot is gone.** A session that began while the collector
   was down is adopted at boot and starts at the boot; it is never backdated. The API
   says so rather than pretending the first interval was quiet.
+- **Retention starts when per-member collection starts.** `member_day` and
+  `member_tenure` begin empty and fill forward, so cohorts that joined earlier show
+  `unmeasured` cells for the days before that rather than zeros. The tenure backfill
+  covers current members' join dates once, so their cohorts exist; their activity
+  history does not.
+- **Departed members are mostly invisible.** Only departures this collector watched are
+  known, so `left_server_confirmed` in core churn is a floor and an untracked departure
+  looks like someone who went quiet.
+- **Suppression is a floor, not a proof of anonymity.** It stops the API from handing a
+  model a cell about one person, and it closes subtraction attacks between published
+  cells. It does not stop an operator with database access, and on a very small server it
+  will withhold most of the table — which is the correct outcome, not a bug.
 - **Structure is current state plus changes, not a history.** A rename that happened
   before collection began is invisible; only the current name is known. Rows are kept
   after deletion only so old activity can still be labelled.
