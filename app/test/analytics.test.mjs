@@ -1205,7 +1205,12 @@ test('quality reports whether the per-member daily grain is filling', () => {
     'a', dayOf(ts) - 10 * 86400, 'backfill', ts,
   );
 
+  db.run('INSERT INTO collector_day(day_ts, heartbeats, boots, first_ts, last_ts) VALUES(?,1,1,?,?)', dayOf(ts), ts, ts);
+
   const out = Q.qualityReport(db, cfg(), { ts });
+  assert.equal(out.collector_days.heartbeat_since, new Date(dayOf(ts) * 1000).toISOString().slice(0, 10));
+  assert.match(out.collector_days.note, /Heartbeats begin/);
+  assert.match(out.collector_days.note, /unknown, not unobserved/);
   assert.equal(out.privacy.per_member_rows.member_day.rows, 2);
   assert.equal(out.privacy.per_member_rows.member_day.days, 2);
   assert.equal(out.privacy.per_member_rows.member_day.first_day, new Date((dayOf(ts) - 86400) * 1000).toISOString().slice(0, 10));

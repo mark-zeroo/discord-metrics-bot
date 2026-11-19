@@ -304,3 +304,17 @@ test('an empty period list says whether to wait or to widen the window', () => {
   assert.equal(narrow.trend.status, STATUS.unmeasured);
   assert.match(narrow.trend.detail, /shorter than one complete week/);
 });
+
+test('the quality block echoes the share this request used, not the default', () => {
+  const db = openDb(':memory:');
+  block(db, 'c', 20, week(1), 50);
+  block(db, 'o', 80, week(1), 2);
+
+  const asked = coreConcentration(db, cfg(), { window: window90, bucket: 'week', share: 0.3, ts: TS });
+  assert.equal(asked.share, 0.3);
+  // Two numbers for one request is how a reader concludes one of them is wrong.
+  assert.equal(asked.quality.core_share, 0.3);
+
+  const defaulted = coreConcentration(db, cfg(), { window: window90, bucket: 'week', ts: TS });
+  assert.equal(defaulted.quality.core_share, defaulted.share);
+});

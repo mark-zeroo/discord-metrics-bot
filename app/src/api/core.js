@@ -109,7 +109,7 @@ export function coreConcentration(
       periods: [],
       transitions: [],
       status_legend: legend,
-      quality: quality(db, config, ts),
+      quality: quality(db, config, ts, share),
     };
   }
 
@@ -126,7 +126,7 @@ export function coreConcentration(
       status_legend: legend,
       suppression: suppressionBlock({ k, cells: [] }),
       caveats: caveats(config),
-      quality: quality(db, config, ts),
+      quality: quality(db, config, ts, share),
     };
   }
 
@@ -178,7 +178,7 @@ export function coreConcentration(
       status_legend: legend,
       suppression: suppressionBlock({ k, cells: [] }),
       caveats: caveats(config),
-      quality: quality(db, config, ts),
+      quality: quality(db, config, ts, share),
     };
   }
 
@@ -438,7 +438,7 @@ export function coreConcentration(
     suppression: suppressionBlock({ k, cells }),
     status_legend: legend,
     caveats: caveats(config),
-    quality: quality(db, config, ts),
+    quality: quality(db, config, ts, share),
   };
 }
 
@@ -453,12 +453,15 @@ function caveats(config) {
   ];
 }
 
-function quality(db, config, ts) {
+function quality(db, config, ts, share = config.analytics.coreShare) {
   return {
     generated_at: iso(ts),
     per_member_counters: config.privacy.perMemberCounters,
     min_cell: config.privacy.minCell,
-    core_share: config.analytics.coreShare,
+    // The share actually used for this request, not the configured default: a
+    // caller asking for 0.3 was getting share: 0.3 at the top level and
+    // core_share: 0.2 here, two numbers for one request.
+    core_share: share,
     core_periods: config.analytics.corePeriods,
   };
 }

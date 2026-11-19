@@ -505,7 +505,10 @@ test('quality reports the anonymity floor and which days were observed', async (
   assert.match(body.privacy.suppression, /below/);
   assert.ok(body.collector_days);
   assert.equal(typeof body.collector_days.recorded, 'number');
-  assert.match(body.collector_days.note, /not observed/);
+  // The note must not claim "no heartbeat means nobody was watching": this
+  // fixture has no heartbeats and nine days of data would say otherwise.
+  assert.match(body.collector_days.note, /No heartbeats recorded yet/);
+  assert.equal(body.collector_days.heartbeat_since, null);
   // This instance runs with PER_MEMBER_COUNTERS=off, so the per-member
   // diagnostics are absent rather than zero. The populated shape is covered by
   // the analytics test that runs in hmac mode.

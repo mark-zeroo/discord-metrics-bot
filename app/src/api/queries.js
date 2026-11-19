@@ -890,6 +890,18 @@ export function qualityReport(db, config, { ts = now(), voiceStats = null } = {}
   const collectorDays = db.get(
     'SELECT COUNT(*) AS n, MIN(day_ts) AS first, MAX(day_ts) AS last FROM collector_day',
   );
+  // Days with any recorded row, for the note below: the only coverage evidence
+  // available before the heartbeat table existed.
+  const daysWithRows = db.get(
+    `SELECT COUNT(*) AS n FROM (
+       SELECT day_ts FROM message_day WHERE day_ts < ?
+       UNION SELECT day_ts FROM voice_day WHERE day_ts < ?
+       UNION SELECT day_ts FROM growth_day WHERE day_ts < ?
+     )`,
+    dayOf(ts),
+    dayOf(ts),
+    dayOf(ts),
+  )?.n ?? 0;
 
   return {
     ...quality(db, config, ts),
@@ -899,9 +911,21 @@ export function qualityReport(db, config, { ts = now(), voiceStats = null } = {}
       recorded: collectorDays?.n ?? 0,
       first: collectorDays?.first ? isoDate(collectorDays.first) : null,
       last: collectorDays?.last ? isoDate(collectorDays.last) : null,
+      // The heartbeat table starts when the feature does, which is later than
+      // collection did. Saying "1 day recorded" next to "days_with_data: 10" and a
+      // note claiming a missing heartbeat means nobody was watching is a
+      // self-contradiction; the note now separates unknown from unobserved.
+      heartbeat_since: collectorDays?.first ? isoDate(collectorDays.first) : null,
+      days_with_data: daysWithRows,
       note:
-        'One heartbeat per UTC day the process ran, written by the maintenance sweep. ' +
-        'A day with no heartbeat was not observed; a day with a heartbeat and no activity was quiet.',
+        collectorDays?.n
+          ? 'One heartbeat per UTC day the process ran, written by the maintenance sweep. ' +
+            `Heartbeats begin ${isoDate(collectorDays.first)}, which is later than collection ` +
+            `(${daysWithRows} day(s) carry data), so a missing heartbeat ` +
+            'before that date is unknown, not unobserved. After it, a day with a heartbeat and ' +
+            'no activity was quiet.'
+          : 'No heartbeats recorded yet: this table is new, so nothing here says which days the ' +
+            'collector ran. days_with_data is the only coverage signal available.',
     },
     privacy: {
       min_cell: config.privacy.minCell,
