@@ -73,6 +73,23 @@ test('core is the top share of active members and concentration is reported', ()
   assert.equal(p.concentration.members_for_80_percent_of_messages.value, 19);
 });
 
+test('a period nobody posted in is a measured zero, not a withheld one', () => {
+  const db = openDb(':memory:');
+  block(db, 'c', 20, week(3), 50);
+  // week(2) and week(1) are empty: the collector was running, nobody posted.
+  for (let d = 1; d <= 21; d += 1) {
+    db.run('INSERT INTO collector_day(day_ts, heartbeats, boots, first_ts, last_ts) VALUES(?,1,1,?,?)', week(2) + d * DAY, 0, 0);
+  }
+
+  const out = coreConcentration(db, cfg(), { window: window90, bucket: 'week', ts: TS });
+  const empty = out.periods.find((p) => p.starts === isoDate(week(1)));
+  assert.equal(empty.active_members.value, 0);
+  assert.equal(empty.core_size.value, 0);
+  assert.equal(empty.status, STATUS.no_data);
+  assert.equal(empty.concentration, undefined);
+  assert.match(empty.reason, /measured zero/);
+});
+
 test('a period with fewer than k active members is withheld entirely', () => {
   const db = openDb(':memory:');
   block(db, 't', 8, week(1), 30);
@@ -83,7 +100,24 @@ test('a period with fewer than k active members is withheld entirely', () => {
   assert.equal(p.active_members.value, null);
   assert.equal(p.core_size.value, null);
   assert.equal(p.concentration, undefined);
-  assert.match(p.reason, /describe a person, not a community/);
+  assert.match(p.reason, /below the anonymity floor/);
+  assert.match(p.reason, /not a community/);
+});
+
+test('the reason names the cell that was too small, not a blanket floor', () => {
+  const db = openDb(':memory:');
+  // 25 active, core of 5: the period is withheld because the *core* is too small,
+  // and saying "fewer than 10 active members" next to active_members: 25 would
+  // contradict the same payload.
+  block(db, 'c', 25, week(1), 30);
+
+  const out = coreConcentration(db, cfg(), { window: window90, bucket: 'week', ts: TS });
+  const p = out.periods[0];
+  assert.equal(p.active_members.value, 25);
+  assert.equal(p.core_size.status, STATUS.suppressed_small_count);
+  assert.equal(p.status, STATUS.suppressed_small_count);
+  assert.match(p.reason, /core is 5 of 25 active members/);
+  assert.doesNotMatch(p.reason, /fewer than 10 active members/);
 });
 
 test('the distribution bands use complementary suppression', () => {

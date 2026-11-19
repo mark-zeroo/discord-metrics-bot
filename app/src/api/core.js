@@ -13,6 +13,7 @@ import {
   STATUS_LEGEND,
   countCell,
   isPublished,
+  published,
   ratioCell,
   suppressPartition,
   suppressionBlock,
@@ -208,16 +209,20 @@ export function coreConcentration(
     );
     coreSets.set(start, core);
 
-    const activeCell = countCell(active, { k, base: active });
-    const coreCell = countCell(coreSize, { k, base: active });
-    const publishable = isPublished(activeCell) && isPublished(coreCell);
+    // A period nobody posted in is a measured zero, not a withheld one: publishing
+    // 0 here identifies nobody, and calling it "suppressed" would make a quiet week
+    // look like a policy decision.
+    const empty = active === 0;
+    const activeCell = empty ? published(0) : countCell(active, { k, base: active });
+    const coreCell = empty ? published(0) : countCell(coreSize, { k, base: active });
+    const publishable = empty || (isPublished(activeCell) && isPublished(coreCell));
     cells.push(activeCell, coreCell);
 
     const entry = {
       period: bucketLabel(start, bucket),
       starts: isoDate(start),
       ends: isoDate(periodEnd(start, bucket) - DAY),
-      status: publishable ? STATUS.published : STATUS.suppressed_small_count,
+      status: empty ? STATUS.no_data : publishable ? STATUS.published : STATUS.suppressed_small_count,
       active_members: activeCell,
       core_size: coreCell,
       // The fraction that defined the core, so a reader can see why core_size is
@@ -225,10 +230,17 @@ export function coreConcentration(
       core_share_used: share,
     };
 
-    if (!publishable) {
-      entry.reason =
-        `Concentration is not published for a period with fewer than ${k} active members: ` +
-        '"one member wrote most of it" would describe a person, not a community.';
+    if (empty) {
+      entry.reason = 'No member activity was recorded in this period: a measured zero, not a withheld figure.';
+    } else if (!publishable) {
+      // Name the cell that actually failed. Blaming the active count when 25 people
+      // were active and only the 5-member core was too small sends the reader to
+      // the wrong knob, and reads as a contradiction in the same payload.
+      entry.reason = !isPublished(activeCell)
+        ? `${active} active member${active === 1 ? ' is' : 's are'} below the anonymity floor of ${k}: ` +
+          'a concentration figure would describe those people, not a community.'
+        : `The core is ${coreSize} of ${active} active members, which is below the anonymity ` +
+          `floor of ${k}: a core that small can be named person by person.`;
     } else {
       const topN = Math.max(1, Math.ceil(active * 0.1));
       const topShare = messages.slice(0, topN).reduce((a, b) => a + b, 0) / total;
@@ -340,29 +352,31 @@ export function coreConcentration(
   }
 
   // ------------------------------------------------------------------- trend
-  const published = periods.filter((p) => p.status === STATUS.published && p.concentration);
+  // Named `publishedPeriods`, not `published`: the latter shadows the imported
+  // cell constructor in this scope and every use of it above dies in the TDZ.
+  const publishedPeriods = periods.filter((p) => p.status === STATUS.published && p.concentration);
   let trend;
-  if (published.length < minPeriodsForTrend) {
+  if (publishedPeriods.length < minPeriodsForTrend) {
     trend = {
-      status: published.length === 0 ? STATUS.suppressed_small_count : STATUS.unmeasured,
-      periods_published: published.length,
+      status: publishedPeriods.length === 0 ? STATUS.suppressed_small_count : STATUS.unmeasured,
+      periods_published: publishedPeriods.length,
       periods_needed: minPeriodsForTrend,
       detail:
         `A direction needs at least ${minPeriodsForTrend} publishable periods; this window has ` +
-        `${published.length}. Weekly concentration moves too much for two points to mean anything.`,
+        `${publishedPeriods.length}. Weekly concentration moves too much for two points to mean anything.`,
     };
   } else {
-    const half = Math.max(1, Math.floor(published.length / 2));
+    const half = Math.max(1, Math.floor(publishedPeriods.length / 2));
     const mean = (arr, pick) => arr.reduce((acc, p) => acc + pick(p), 0) / arr.length;
-    const giniEarly = mean(published.slice(0, half), (p) => p.concentration.gini);
-    const giniLate = mean(published.slice(-half), (p) => p.concentration.gini);
-    const topEarly = mean(published.slice(0, half), (p) => p.concentration.share_of_messages_from_top_10_percent);
-    const topLate = mean(published.slice(-half), (p) => p.concentration.share_of_messages_from_top_10_percent);
+    const giniEarly = mean(publishedPeriods.slice(0, half), (p) => p.concentration.gini);
+    const giniLate = mean(publishedPeriods.slice(-half), (p) => p.concentration.gini);
+    const topEarly = mean(publishedPeriods.slice(0, half), (p) => p.concentration.share_of_messages_from_top_10_percent);
+    const topLate = mean(publishedPeriods.slice(-half), (p) => p.concentration.share_of_messages_from_top_10_percent);
     const direction = (delta, threshold) =>
       delta > threshold ? 'more_concentrated' : delta < -threshold ? 'less_concentrated' : 'flat';
     trend = {
       status: STATUS.published,
-      periods_compared: published.length,
+      periods_compared: publishedPeriods.length,
       method: `mean of the first ${half} periods vs the last ${half} published periods`,
       gini: {
         early: Number(giniEarly.toFixed(3)),
