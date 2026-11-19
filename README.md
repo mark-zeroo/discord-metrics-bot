@@ -855,9 +855,13 @@ not started, window never observed, window under six observed hours, baseline un
 day, baseline under `EVENT_BASELINE_NOISY_DAYS` of activity, fewer than
 `EVENT_MATCHED_MIN_DAYS` baseline days for a weekday the event touches, no baseline
 activity to divide by, an event window below `EVENT_UPLIFT_MIN_MESSAGES`, or another
-tagged window overlapping the same hours. Each refusal carries a code, the measured
-activity is still reported, and `uplift` is `null` only when nothing at all is
-publishable — so a refusal never reads as "no impact".
+tagged window *partially* overlapping the same hours. A tag wholly inside another
+window is reported under `nested_events` and does not block — an umbrella tournament
+and the weekend matches inside it are a hierarchy, not two competing measurements,
+and treating them as a conflict made every tag on a real server refuse. Each refusal
+carries a code, a detail and a remedy; the measured activity is still reported, and
+`uplift` is `null` only when nothing at all is publishable — so a refusal never reads
+as "no impact".
 
 ---
 

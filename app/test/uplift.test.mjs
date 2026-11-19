@@ -270,3 +270,101 @@ test('the matched baseline is absent rather than wrong when heartbeats are missi
   assert.equal(tag.baseline.matched.days_used, 28, 'pre-heartbeat history still counts');
   assert.match(tag.baseline.matched.note, /inflate uplift/);
 });
+
+// ------------------------------------------------- nesting, refusals, coverage
+
+test('a nested tag does not block, a partial overlap does', () => {
+  const db = openDb(':memory:');
+  weekdayShapedBaseline(db, dayOf(saturday));
+  // Umbrella: the whole weekend. Child: Saturday afternoon, entirely inside it.
+  const umbrella = addTag(db, { name: 'Umbrella', start: saturday, end: saturday + DAY });
+  addTag(db, { name: 'Child', start: saturday + 8 * HOUR, end: saturday + 16 * HOUR });
+  for (let h = 8; h < 16; h += 1) {
+    db.run(
+      'INSERT INTO message_hour(hour_ts, channel_id, messages, unique_authors) VALUES(?,?,?,?)',
+      saturday + h * HOUR, 'c1', 5, 2,
+    );
+  }
+
+  const tags = Q.tags(db, cfg(), { limit: 5, ts: TS }).tags;
+  const byName = Object.fromEntries(tags.map((t) => [t.name, t]));
+
+  assert.equal(byName.Child.overlapping_events.length, 0, 'containment is not a conflict');
+  assert.deepEqual(byName.Child.nested_events.map((e) => e.id), [umbrella]);
+  assert.equal(byName.Child.nested_events[0].relation, 'encloses_this_event');
+  assert.equal(byName.Child.uplift_status.messages.status, 'published');
+
+  assert.equal(byName.Umbrella.nested_events[0].relation, 'inside_this_event');
+  assert.equal(byName.Umbrella.overlapping_events.length, 0);
+
+  // A partial overlap — each window reaching outside the other — still refuses.
+  const db2 = openDb(':memory:');
+  weekdayShapedBaseline(db2, dayOf(saturday));
+  addTag(db2, { name: 'A', start: saturday, end: saturday + 20 * HOUR });
+  addTag(db2, { name: 'B', start: saturday + 12 * HOUR, end: saturday + 30 * HOUR });
+  const tags2 = Q.tags(db2, cfg(), { limit: 5, ts: TS }).tags;
+  for (const t of tags2) {
+    assert.ok(t.refusal_codes.includes('overlapping_event'), t.name);
+    assert.equal(t.overlapping_events.length, 1);
+    assert.equal(t.nested_events.length, 0);
+  }
+});
+
+test('every refusal carries its metric, detail and remedy', () => {
+  const db = openDb(':memory:');
+  weekdayShapedBaseline(db, dayOf(saturday));
+  addTag(db, { start: dayOf(TS) + 4 * DAY, end: dayOf(TS) + 4 * DAY + 6 * HOUR });
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts: TS }).tags;
+  assert.equal(tag.refusal_codes.length, 1);
+  assert.equal(tag.refusals.length, 3, 'one entry per metric, matching uplift_status');
+  const messages = tag.refusals.find((r) => r.metric === 'messages');
+  assert.equal(messages.code, 'not_started');
+  assert.match(messages.detail, /has not started/);
+  assert.match(messages.remedy, /once the window has opened/);
+  // The old payload carried refusals: [] beside a non-empty refusal_codes.
+  assert.deepEqual(
+    tag.refusals.map((r) => r.metric).sort(),
+    Object.keys(tag.uplift_status).sort(),
+  );
+});
+
+test('a baseline mixing pre-heartbeat and heartbeat days uses each day on its own terms', () => {
+  const db = openDb(':memory:');
+  weekdayShapedBaseline(db, dayOf(saturday));
+  // Heartbeats start 5 days before the event: the earlier baseline days have rows
+  // but no heartbeat, and must still count through the activity fallback.
+  for (let d = 1; d <= 5; d += 1) {
+    db.run('INSERT INTO collector_day(day_ts, heartbeats, boots, first_ts, last_ts) VALUES(?,1,1,0,0)', saturday - d * DAY);
+  }
+  addTag(db, { start: saturday, end: saturday + 24 * HOUR });
+  db.run(
+    'INSERT INTO message_hour(hour_ts, channel_id, messages, unique_authors) VALUES(?,?,?,?)',
+    saturday + 2 * HOUR, 'c1', 60, 3,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts: TS }).tags;
+  assert.equal(tag.baseline.matched.days_used, 28, 'pre-heartbeat days still count');
+  assert.equal(tag.baseline.matched.heartbeats_available, true);
+  assert.equal(tag.baseline.matched.heartbeat_from, `${isoDate(saturday - 5 * DAY)}T00:00:00Z`.slice(0, 10));
+  assert.equal(tag.uplift_status.messages.status, 'published');
+});
+
+test('the trailing average and the matched baseline agree on a weekday-shaped window', () => {
+  const db = openDb(':memory:');
+  weekdayShapedBaseline(db, dayOf(saturday));
+  addTag(db, { start: saturday, end: saturday + 24 * HOUR });
+  db.run(
+    'INSERT INTO message_hour(hour_ts, channel_id, messages, unique_authors) VALUES(?,?,?,?)',
+    saturday + 2 * HOUR, 'c1', 60, 3,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts: TS }).tags;
+  // Same day set, so the overall mean must equal the sum over weekdays divided by
+  // 7: (5*10 + 2*100) / 7 = 35.7. They used to disagree because the trailing rate
+  // divided by a fractional coverage span instead of the days it summed.
+  assert.equal(tag.baseline.messages_per_day, 35.7);
+  const fromWeekdays = tag.baseline.matched.messages_per_day_by_weekday;
+  const mean = Object.values(fromWeekdays).reduce((a, b) => a + b, 0) / 7;
+  assert.equal(Number(mean.toFixed(1)), 35.7);
+});

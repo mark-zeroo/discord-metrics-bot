@@ -509,8 +509,12 @@ test('a tag whose window has not opened is upcoming, not ongoing', () => {
   assert.equal(tag.during, null);
   assert.equal(tag.uplift, null);
   assert.match(tag.note, /has not started/);
-  // The baseline is still useful (it is what the event will be compared to).
-  assert.equal(typeof tag.baseline.messages_per_day, 'number');
+  // The baseline block is still there (it is what the event will be compared to),
+  // but on a database with no rows and no heartbeats it reports days_used: 0 and a
+  // null rate rather than "0.0 messages/day", which would be a measurement claim
+  // about a window nothing ever watched.
+  assert.equal(tag.baseline.matched.days_used, 0);
+  assert.equal(tag.baseline.messages_per_day, null);
 });
 
 test('a tag inside its window is ongoing, and a finished one is past', () => {

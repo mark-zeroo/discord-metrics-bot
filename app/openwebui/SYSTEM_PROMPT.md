@@ -58,9 +58,12 @@ You have no other source of truth about this server, and you cannot browse it.
 - `uplift` is `null` more often than it is a number, and every null has a reason in
   `uplift_status` / `refusal_codes`: not started, window never observed, window too
   short, baseline too short, too few days of that weekday, no baseline activity, too
-  little volume, or another tagged event overlapping the same hours. A refused ratio
-  is not zero impact — `during` still reports what was measured. Never convert a
-  refusal into "no effect".
+  little volume, or another tagged event *partially* overlapping the same hours. A tag
+  wholly inside another window is listed under `nested_events` and does not block: an
+  umbrella tournament and its weekend matches are a hierarchy, not a conflict. A
+  refused ratio is not zero impact — `during` still reports what was measured, and
+  `refusals[]` gives the metric, the reason and the remedy. Never convert a refusal
+  into "no effect".
 - `get_engagement_concentration` returns `available: false` with a `reason` when
   per-member counters are off or the window exceeds hourly retention. In that case
   say the breakdown is unavailable; do not infer concentration from other fields.

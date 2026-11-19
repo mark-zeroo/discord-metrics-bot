@@ -1822,6 +1822,10 @@ function weekdayBaseline(db, { baseFrom, baseEnd, installDay, partialDays, notAf
       .map((r) => r.day_ts),
   );
   const heartbeatsAvailable = heartbeatDays.size > 0;
+  // The first day the heartbeat table covers. Before it, absence of a heartbeat
+  // says nothing about whether the collector ran, so the fallback below applies
+  // per day rather than to the whole window.
+  const firstHeartbeatDay = heartbeatsAvailable ? Math.min(...heartbeatDays) : null;
 
   const messagesByDay = new Map(
     db
@@ -1869,11 +1873,17 @@ function weekdayBaseline(db, { baseFrom, baseEnd, installDay, partialDays, notAf
     ...voiceByDay.keys(),
     ...joinsByDay.keys(),
   ]);
-  const usableDay = (d) =>
-    d >= installDay &&
-    d <= lastCompleteDay &&
-    !partialDays.has(d) &&
-    (heartbeatsAvailable ? heartbeatDays.has(d) : activityDays.has(d));
+  const usableDay = (d) => {
+    if (d < installDay || d > lastCompleteDay || partialDays.has(d)) return false;
+    if (heartbeatDays.has(d)) return true;
+    // No heartbeat for this day. That is evidence of absence only if heartbeats
+    // existed by then: before the first one, a day counts only if the collector
+    // demonstrably wrote something. A single heartbeat anywhere in a 28-day window
+    // used to disable this fallback for the whole window, which zeroed the baseline
+    // for every event on a freshly upgraded install.
+    if (firstHeartbeatDay === null || d < firstHeartbeatDay) return activityDays.has(d);
+    return false;
+  };
 
   const days = [];
   for (let d = dayOf(baseFrom); d < baseEnd; d += DAY) {
@@ -1916,7 +1926,9 @@ function weekdayBaseline(db, { baseFrom, baseEnd, installDay, partialDays, notAf
     mean_joins_per_day: days.length > 0 ? totalJoins / days.length : null,
     sums,
     counts,
+    totals: { messages: totalMessages, voice: totalVoice, joins: totalJoins },
     heartbeats_available: heartbeatsAvailable,
+    heartbeat_from: firstHeartbeatDay === null ? null : isoDate(firstHeartbeatDay),
   };
 }
 
@@ -2059,9 +2071,6 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
   const ratesMeaningful = observable && (fullyObserved || seenHoursExact >= 6);
   const messagesPerDay = ratesMeaningful ? messagesDuring / seenSpanDays : null;
   const voiceHoursPerDay = ratesMeaningful ? secondsDuring / 3600 / seenSpanDays : null;
-  const baseMessagesPerDay = baselineMeasurable ? (baseMsg?.v ?? 0) / days : null;
-  const baseVoicePerDay = baselineMeasurable ? (baseVoice?.v ?? 0) / 3600 / days : null;
-  const baseJoinsPerDay = baselineMeasurable ? (baseJoins?.v ?? 0) / days : null;
 
   // A tag whose window has not opened yet is not "ongoing": an event tagged for
   // next week would otherwise be reported as happening right now, and its
@@ -2090,8 +2099,22 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
   });
   const hours = observable ? hoursByWeekday(seenFrom, seenTo) : new Array(7).fill(0);
 
+  // The trailing average uses the same set of days as the matched baseline: those
+  // the collector actually observed, excluding partial days and unfinished ones.
+  // Dividing a sum over N days by a fractional coverage span (the old behaviour)
+  // reported 436/day for a window whose days carried 350/day.
+  const baseMessagesPerDay =
+    matched.days_used > 0 ? matched.totals.messages / matched.days_used : null;
+  const baseVoicePerDay =
+    matched.days_used > 0 ? matched.totals.voice / 3600 / matched.days_used : null;
+  const baseJoinsPerDay =
+    matched.days_used > 0 ? matched.totals.joins / matched.days_used : null;
+
   // Two tagged events in the same hours cannot be told apart: the uplift of one is
-  // partly the other. Refusing is the only honest answer.
+  // partly the other. But tags nest — an umbrella tournament with a weekend match
+  // inside it is a hierarchy, not two competing measurements, and treating it as a
+  // conflict made every tag on a real server refuse. Only a *partial* overlap (each
+  // window reaching outside the other) blocks; containment is reported as nesting.
   const overlaps = db.all(
     `SELECT id, name, start_ts, end_ts FROM event_tag
       WHERE id <> ? AND start_ts < ? AND end_ts > ?`,
@@ -2099,12 +2122,20 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
     end,
     start,
   );
-
-  const refused = [];
-  const upliftStatus = (metric, code, detail, remedy) => {
-    refused.push({ metric, code, detail, remedy: remedy ?? null });
-    return { status: 'refused', code, value: null };
+  // Normalise both sides: rows from the tag table carry start_ts/end_ts, while the
+  // window under test is {start, end}. Mixing the two made every containment test
+  // one-way, so an umbrella saw its own child as a partial conflict.
+  const boundsOf = (w) => ({ start: w.start_ts ?? w.start, end: w.end_ts ?? w.end });
+  const strictlyContains = (outer, inner) => {
+    const a = boundsOf(outer);
+    const b = boundsOf(inner);
+    return a.start <= b.start && a.end >= b.end && (a.start < b.start || a.end > b.end);
   };
+  const partialOverlaps = overlaps.filter(
+    (o) =>
+      !strictlyContains(o, { start, end }) && !strictlyContains({ start, end }, o),
+  );
+  const nestedOverlaps = overlaps.filter((o) => !partialOverlaps.includes(o));
 
   const blocked = (() => {
     if (status === 'upcoming') {
@@ -2123,12 +2154,13 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
           'per-day rate needs at least six.',
       ];
     }
-    if (overlaps.length > 0) {
+    if (partialOverlaps.length > 0) {
       return [
         'overlapping_event',
-        `Another tagged window overlaps this one (${overlaps
+        `Another tagged window partially overlaps this one (${partialOverlaps
           .map((o) => `#${o.id}`)
-          .join(', ')}), so activity cannot be attributed to either.`,
+          .join(', ')}), so activity cannot be attributed to either. Nested tags (a ` +
+          'sub-event inside an umbrella window) are reported separately and do not block.',
       ];
     }
     if (!baselineMeasurable) {
@@ -2167,7 +2199,7 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
   for (const metric of metrics) {
     if (blocked) {
       uplift[metric.key] = null;
-      upliftStatusMap[metric.key] = { status: 'refused', code: blocked[0] };
+      upliftStatusMap[metric.key] = { status: 'refused', code: blocked[0], detail: blocked[1] };
       continue;
     }
     const exp = expectation(metric.hours, matched, metric.key, minMatchedDays);
@@ -2207,11 +2239,30 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
     publishedAny = true;
   }
 
-  const refusalCodes = [...new Set(refused.map((r) => r.code).concat(
-    Object.values(upliftStatusMap)
-      .filter((s) => s.status === 'refused')
-      .map((s) => s.code),
-  ))];
+  // One refusal object per metric, derived from the status map that is published
+  // beside it. The previous version kept a separate array that nothing ever wrote
+  // to, so every tag shipped `refusals: []` next to a non-empty refusal_codes:
+  // a payload that contradicted itself.
+  const REMEDIES = {
+    not_started: 'Measure again once the window has opened.',
+    window_unobserved: 'Nothing can be recovered: no rows exist for that window.',
+    window_too_short: 'Tag at least six hours of the event, or accept the totals without a rate.',
+    baseline_unmeasurable: 'Wait until a full day of baseline exists before the window starts.',
+    baseline_too_short: `Wait for ${noisyDays} days of activity before the event, or lower EVENT_BASELINE_NOISY_DAYS.`,
+    matched_baseline_thin: 'Lengthen EVENT_BASELINE_DAYS so each weekday appears at least EVENT_MATCHED_MIN_DAYS times.',
+    no_baseline_activity: 'None: the baseline has no activity to divide by.',
+    insufficient_volume: 'Quote the totals instead; a ratio from this few messages is noise.',
+    overlapping_event: 'Tag the events so they do not partially overlap, or measure the enclosing window only.',
+  };
+  const refusals = Object.entries(upliftStatusMap)
+    .filter(([, status]) => status.status === 'refused')
+    .map(([metric, status]) => ({
+      metric,
+      code: status.code,
+      detail: status.detail ?? null,
+      remedy: REMEDIES[status.code] ?? null,
+    }));
+  const refusalCodes = [...new Set(refusals.map((r) => r.code))];
 
   return {
     id: tag.id,
@@ -2282,6 +2333,9 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
           matched.mean_joins_per_day === null ? null : Number(matched.mean_joins_per_day.toFixed(2)),
         min_days_per_weekday: minMatchedDays,
         heartbeats_available: matched.heartbeats_available,
+        // First day with a heartbeat. Before it, a missing heartbeat means
+        // "not recorded", not "not running".
+        heartbeat_from: matched.heartbeat_from,
         note: matched.heartbeats_available
           ? 'Baseline days with a known collection gap are excluded; a day the collector was ' +
             'down is not a quiet day, and counting it as zero inflates uplift.'
@@ -2295,10 +2349,16 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
     uplift: publishedAny ? uplift : null,
     uplift_status: upliftStatusMap,
     refusal_codes: refusalCodes,
-    refusals: refused,
-    overlapping_events: overlaps.length
-      ? overlaps.map((o) => ({ id: o.id, name: safeLabel(o.name) }))
-      : [],
+    refusals,
+    // A partial overlap blocks; containment is a hierarchy, not a conflict. Keeping
+    // the two lists apart is what lets an umbrella tournament and its weekend
+    // matches both be reported instead of refusing each other.
+    overlapping_events: partialOverlaps.map((o) => ({ id: o.id, name: safeLabel(o.name) })),
+    nested_events: nestedOverlaps.map((o) => ({
+      id: o.id,
+      name: safeLabel(o.name),
+      relation: strictlyContains(o, { start, end }) ? 'encloses_this_event' : 'inside_this_event',
+    })),
     note: tagNotes({
       status,
       observable,
@@ -2345,7 +2405,9 @@ export function tags(db, config, { limit = 20, ts = now() } = {}) {
         'a second look.',
       'A refusal is not a zero. uplift_status says per metric whether the figure was published or ' +
         'refused, refusal_codes lists why, and during still reports what was measured.',
-      'Two overlapping tagged windows cannot be attributed, so they refuse uplift and name each other.',
+      'Two tagged windows that partially overlap cannot be attributed, so they refuse uplift and ' +
+        'name each other. A window wholly inside another (a weekend match inside an umbrella ' +
+        'tournament) is reported as nested instead: a hierarchy is not a conflict.',
     ],
     quality: quality(db, config, ts),
   };
