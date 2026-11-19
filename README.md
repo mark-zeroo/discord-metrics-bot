@@ -1436,7 +1436,7 @@ anyway.
 
 ```bash
 cd app                       # the Node project; every npm command lives here
-npm test                     # 282 tests, node:test, no test framework needed
+npm test                     # full suite, node:test, no test framework needed
 npm test -- --test-name-pattern restart
 node --test test/repair.test.mjs
 ```

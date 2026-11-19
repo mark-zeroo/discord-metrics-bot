@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { openDb } from '../src/db.js';
 import * as Q from '../src/api/queries.js';
-import { DAY, HOUR, dayOf, hourOf, isoDate } from '../src/time.js';
+import { DAY, HOUR, dayOf, hourOf, iso, isoDate } from '../src/time.js';
 import { makeConfig } from './fixtures.mjs';
 
 // Fixed Wednesday evening. Every date below is derived from it, so the weekday
@@ -18,7 +18,16 @@ function lastSaturday(fromTs) {
   return d;
 }
 
-const cfg = (env = {}) => makeConfig({ PER_MEMBER_COUNTERS: 'hmac', ...env });
+function cfg({ perMemberCounters = 'hmac', ...extra } = {}) {
+  // Extra env keys pass straight through: the suppression floor is a real config
+  // value and a test that needs a small one should set it, not bypass the guard.
+  const env = { PER_MEMBER_COUNTERS: perMemberCounters, ...extra };
+  if (extra.minCell !== undefined) {
+    env.PRIVACY_MIN_CELL = String(extra.minCell);
+    delete env.minCell;
+  }
+  return makeConfig(env);
+}
 
 function addTag(db, { name = 'Cup', start, end, kind = 'tournament' }) {
   db.run(
@@ -368,3 +377,475 @@ test('the trailing average and the matched baseline agree on a weekday-shaped wi
   const mean = Object.values(fromWeekdays).reduce((a, b) => a + b, 0) / 7;
   assert.equal(Number(mean.toFixed(1)), 35.7);
 });
+
+/* ------------------------------------------------------------------ *
+ * end-to-end tag payloads on now-relative fixtures
+ *
+ * These exercise /v1/tags through its whole shape — notes and their caps, joins
+ * basis, partial windows, ordering — rather than the weekday-matching arithmetic
+ * above. They live here rather than in their own file because both halves
+ * describe one endpoint, and a second copy of the tag fixtures is how test
+ * suites rot.
+ * ------------------------------------------------------------------ */
+
+const GUILD = '1';
+
+const window30 = { label: '30d', seconds: 30 * DAY, all: false };
+
+function message(userId, channelId, ts) {
+  return {
+    inGuild: () => true,
+    guildId: GUILD,
+    author: { id: userId, bot: false },
+    member: { roles: { cache: new Map() } },
+    channelId,
+    system: false,
+    createdTimestamp: ts * 1000,
+  };
+}
+
+const now = () => Math.floor(Date.now() / 1000);
+
+// --------------------------------------------------------------- exact posters
+
+function tagFixture({ installedDaysAgo }) {
+  const db = openDb(':memory:');
+  const ts = now();
+  const installed = ts - installedDaysAgo * DAY;
+  db.setMeta('boot.first', new Date(installed * 1000).toISOString());
+  db.setMeta('backfill.completed', new Date(installed * 1000).toISOString());
+  const addTag = (name, start, end, extra = {}) =>
+    db.run(
+      `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+       VALUES(?,?,?,?,?,?,?,?)`,
+      name, start, end, extra.kind ?? 'tournament', extra.prize ?? null,
+      extra.participants ?? null, extra.notes ?? null, ts,
+    );
+  return { db, ts, installed, addTag };
+}
+
+test('tag impact compares the window against the trailing baseline window', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+  const start = ts - 4 * HOUR;
+  const end = ts - 1 * HOUR;
+
+  db.run(
+    `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+     VALUES(?,?,?,?,?,?,?,?)`,
+    'Spring 5v5 Tourney', start, end, 'tournament', '6000 tokens', 30, null, ts,
+  );
+
+  // 28 baseline days at 100 messages/day = 2800, i.e. 100/day.
+  //
+  // Anchored to the baseline's own end, not to today. The baseline window ends at
+  // dayOf(start), and start is four hours back, so late in the UTC evening the
+  // two differ: inserting days relative to dayOf(ts) put one row past the window
+  // and the test reported 27 observed days. Same intent, no clock dependency.
+  const baseEnd = dayOf(ts - 4 * HOUR);
+  for (let d = 28; d >= 1; d -= 1) {
+    db.run(
+      'INSERT INTO message_day(day_ts, channel_id, messages, unique_authors, partial) VALUES(?,?,?,?,0)',
+      baseEnd - d * DAY,
+      'c1',
+      100,
+      20,
+    );
+  }
+  // Three hours of the tag at 10x the hourly baseline (100/24 ≈ 4.2/h → 42/h).
+  for (let h = 1; h <= 3; h += 1) {
+    db.run(
+      'INSERT INTO message_hour(hour_ts, channel_id, messages, unique_authors) VALUES(?,?,?,?)',
+      hourOf(ts) - h * HOUR,
+      'c1',
+      42,
+      8,
+    );
+  }
+
+  const out = Q.tags(db, cfg(), { limit: 5, ts });
+
+  assert.equal(out.count, 1);
+  const tag = out.tags[0];
+  assert.equal(tag.name, 'Spring 5v5 Tourney');
+  assert.equal(tag.duration_hours, 3);
+  assert.equal(tag.granularity, 'hour');
+  assert.equal(tag.during.messages, 126);
+  assert.equal(tag.baseline.window_days, 28);
+  assert.equal(tag.baseline.days_observed, 28);
+  assert.equal(tag.baseline.coverage_span_days, 28);
+  assert.equal(tag.baseline.messages_per_day, 100);
+  // 42/hour works out to ~1008/day against a 100/day baseline.
+  assert.equal(tag.uplift.messages, 10.08);
+});
+
+test('a tag whose window has not opened is upcoming, not ongoing', () => {
+  // An event tagged for next week used to come back ongoing: true, which reads as
+  // "the tournament is happening and nobody showed up".
+  const db = openDb(':memory:');
+  const ts = now();
+  const start = dayOf(ts) + 4 * DAY;
+  const end = start + 5 * HOUR;
+
+  db.run(
+    `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+     VALUES(?,?,?,?,?,?,?,?)`,
+    'Next week cup', start, end, 'tournament', null, null, null, ts,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.status, 'upcoming');
+  assert.equal(tag.ongoing, false);
+  // Zeros are not the same statement as "not measured yet": a model reads
+  // "0 messages, uplift 0" as a failed event, so an unstarted tag reports nulls.
+  assert.equal(tag.during, null);
+  assert.equal(tag.uplift, null);
+  assert.match(tag.note, /has not started/);
+  // The baseline block is still there (it is what the event will be compared to),
+  // but on a database with no rows and no heartbeats it reports days_used: 0 and a
+  // null rate rather than "0.0 messages/day", which would be a measurement claim
+  // about a window nothing ever watched.
+  assert.equal(tag.baseline.matched.days_used, 0);
+  assert.equal(tag.baseline.messages_per_day, null);
+});
+
+test('a tag inside its window is ongoing, and a finished one is past', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+
+  const insert = (name, start, end) =>
+    db.run(
+      `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+       VALUES(?,?,?,?,?,?,?,?)`,
+      name, start, end, null, null, null, null, ts,
+    );
+
+  insert('Now', ts - HOUR, ts + HOUR);
+  insert('Done', ts - 4 * HOUR, ts - 2 * HOUR);
+
+  const out = Q.tags(db, cfg(), { limit: 5, ts });
+  const byName = new Map(out.tags.map((t) => [t.name, t]));
+  assert.equal(byName.get('Now').status, 'ongoing');
+  assert.equal(byName.get('Now').ongoing, true);
+  assert.equal(byName.get('Done').status, 'past');
+  assert.equal(byName.get('Done').ongoing, false);
+});
+
+test('tag impact falls back to daily rows once hourly rows are pruned', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+  const start = dayOf(ts) - 400 * DAY;
+  const end = start + DAY;
+
+  db.run(
+    `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+     VALUES(?,?,?,?,?,?,?,?)`,
+    'Old game night', start, end, null, null, null, null, ts,
+  );
+  db.run(
+    'INSERT INTO message_day(day_ts, channel_id, messages, unique_authors, partial) VALUES(?,?,?,?,0)',
+    start,
+    'c1',
+    250,
+    15,
+  );
+
+  const out = Q.tags(db, cfg(), { limit: 5, ts });
+  assert.equal(out.tags[0].granularity, 'day');
+  assert.equal(out.tags[0].during.messages, 250);
+});
+
+test('tags on an empty database return an empty list, not an error', () => {
+  const db = openDb(':memory:');
+  const out = Q.tags(db, cfg(), { limit: 5 });
+  assert.equal(out.count, 0);
+  assert.deepEqual(out.tags, []);
+});
+
+// ------------------------------------------------------------------ summary
+
+test('a tournament that began before install reports rates over the observed span', () => {
+  const { db, ts, installed, addTag } = tagFixture({ installedDaysAgo: 1 });
+  // Six-day window, matches on three of those days, but only the last day is
+  // observable: 1800 messages in that day.
+  addTag('Long cup', ts - 5 * DAY, ts + DAY);
+  for (let hour = 0; hour < 24; hour += 2) {
+    db.run(
+      'INSERT INTO message_hour (hour_ts, channel_id, messages) VALUES (?, ?, ?)',
+      installed + hour * HOUR,
+      'c1',
+      150,
+    );
+  }
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.status, 'ongoing');
+  assert.equal(tag.during.messages, 1800);
+  // 1800 over ~1 observed day, not over the 6-day window (which would say 300).
+  assert.equal(tag.during.messages_per_day, 1800);
+  assert.equal(tag.during.observed.complete, false);
+  assert.match(tag.during.observed.from, /T/);
+  assert.match(tag.note, /Coverage: .* of the .* hours this event has run so far/);
+});
+
+test('a tournament that ended before install still reports joins, but no activity', () => {
+  const { db, ts, addTag } = tagFixture({ installedDaysAgo: 1 });
+  addTag('Old cup', ts - 10 * DAY, ts - 5 * DAY);
+  // Current members who joined during the old tournament.
+  db.run('INSERT INTO growth_backfill (day_ts, joins) VALUES (?, ?)', dayOf(ts - 7 * DAY), 9);
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.during.messages, null, 'no messages were ever counted for that window');
+  assert.equal(tag.during.messages_per_day, null);
+  assert.equal(tag.during.voice_hours, null);
+  assert.equal(tag.during.joins, 9, 'join dates do reach back before install');
+  assert.equal(tag.during.joins_basis, 'backfill');
+  assert.equal(tag.during.observed, null);
+  assert.equal(tag.uplift, null);
+  assert.match(tag.note, /ended before collection began/);
+});
+
+test('uplift is null, not zero, when there is no baseline data at all', () => {
+  const { db, ts, addTag } = tagFixture({ installedDaysAgo: 1 });
+  addTag('Cup today', ts - 2 * HOUR, ts + 4 * HOUR);
+  db.run(
+    'INSERT INTO message_hour (hour_ts, channel_id, messages) VALUES (?, ?, ?)',
+    Math.floor((ts - HOUR) / HOUR) * HOUR,
+    'c1',
+    400,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.ok(tag.during.messages > 0, 'activity during the event is measured');
+  // A ratio against zero baseline days is undefined; 0.0 would read as "no impact".
+  assert.equal(tag.uplift, null);
+  assert.equal(tag.baseline.days_observed, 0);
+  assert.match(tag.note, /no usable baseline/i);
+});
+
+test('a long notes field survives the payload intact', () => {
+  const { db, ts, addTag } = tagFixture({ installedDaysAgo: 30 });
+  // 64 characters is where this used to stop, mid-list and with no marker, so
+  // a complete note looked like a corrupted one.
+  const notes = 'first match 11/07, final 11/22; match days 11/07, 11/08, 11/14, 11/15, 11/21, 11/22';
+  addTag('Asia 1v1 Tournament', ts - 3 * DAY, ts + 11 * DAY, { notes });
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.notes, notes, 'nothing lost, nothing ellipsised');
+});
+
+test('notes past the cap are cut visibly, labels still cut at 64', () => {
+  const { db, ts, addTag } = tagFixture({ installedDaysAgo: 30 });
+  addTag('A'.repeat(200), ts - 3 * DAY, ts + 11 * DAY, { notes: 'x'.repeat(700) });
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.notes.length, 512);
+  assert.ok(tag.notes.endsWith('…'), 'the cut is marked');
+  assert.equal(tag.name.length, 64, 'labels keep the short cap');
+  assert.ok(!tag.name.includes('…'), 'a label is a label, not prose');
+});
+
+test('partial days are counted per day, not per channel row', () => {
+  const { db, ts } = tagFixture({ installedDaysAgo: 0 });
+  const today = dayOf(ts);
+  // The install day, seen in two channels. It is one partial day, not two.
+  for (const ch of ['c1', 'c2']) {
+    db.run(
+      'INSERT INTO message_day(day_ts, channel_id, messages, unique_authors, partial) VALUES(?,?,?,?,1)',
+      today,
+      ch,
+      5,
+      2,
+    );
+  }
+  db.run('INSERT INTO growth_day (day_ts, joins, leaves, members, partial) VALUES (?, 0, 0, 1101, 1)', today);
+
+  const q = Q.qualityReport(db, cfg(), { ts });
+  assert.equal(q.partial_days.messages, 1, 'two channels, one day');
+  assert.equal(q.partial_days.growth, 1);
+  assert.deepEqual(q.partial_days.recent.messages, [isoDate(today)], 'no repeat once per channel');
+  assert.equal(q.first_full_day, null, 'the install day is never a full day');
+});
+
+test('first_full_day is the first day collection covered from midnight', () => {
+  const { db, ts } = tagFixture({ installedDaysAgo: 3 });
+  const installDay = dayOf(Math.floor(Date.parse(db.getMeta('backfill.completed')) / 1000));
+  // The install day is partial; the day after it was watched end to end.
+  db.run(
+    'INSERT INTO message_day(day_ts, channel_id, messages, unique_authors, partial) VALUES(?,?,?,?,1)',
+    installDay,
+    'c1',
+    5,
+    2,
+  );
+  db.run(
+    'INSERT INTO message_day(day_ts, channel_id, messages, unique_authors, partial) VALUES(?,?,?,?,0)',
+    installDay + DAY,
+    'c1',
+    40,
+    7,
+  );
+
+  const q = Q.qualityReport(db, cfg(), { ts });
+  assert.equal(q.first_full_day, iso(installDay + DAY));
+  assert.deepEqual(q.partial_days.recent.messages, [isoDate(installDay)]);
+});
+
+test('a partial window under six hours reports totals but no per-day rate', () => {
+  const { db, ts, addTag } = tagFixture({ installedDaysAgo: 0 });
+  // The live case: collection began three hours ago, two messages so far. A
+  // daily rate here would be 2/3h = 16/day, which is noise wearing a number.
+  const installed = ts - 3 * HOUR;
+  db.setMeta('boot.first', new Date(installed * 1000).toISOString());
+  db.setMeta('backfill.completed', new Date(installed * 1000).toISOString());
+  addTag('Tournament starting 5 days ago', ts - 5 * DAY, ts + 5 * DAY);
+  db.run(
+    'INSERT INTO message_hour (hour_ts, channel_id, messages) VALUES (?, ?, ?)',
+    Math.floor((ts - 2 * HOUR) / HOUR) * HOUR,
+    'c1',
+    2,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.during.messages, 2, 'the raw count survives');
+  assert.equal(tag.during.messages_per_day, null, 'but not extrapolated');
+  assert.ok(tag.during.observed.hours < 6);
+  assert.equal(tag.during.observed.complete, false);
+  assert.match(tag.note, /too short for a daily rate/);
+});
+
+test('a fully observed short event still reports a per-day rate', () => {
+  const { db, ts, addTag } = tagFixture({ installedDaysAgo: 30 });
+  // A two-hour match night that the collector saw in full: the extrapolation is
+  // the point, since it is what gets compared against the baseline.
+  const start = ts - 9 * DAY;
+  addTag('Match night', start, start + 2 * HOUR);
+  db.run(
+    'INSERT INTO message_hour (hour_ts, channel_id, messages) VALUES (?, ?, ?)',
+    start + HOUR,
+    'c1',
+    60,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.during.observed.complete, true);
+  assert.ok(tag.during.messages_per_day > 0, 'complete window keeps its rate');
+});
+
+test('a baseline that is mostly in the future is reported as unusable, not diluted', () => {
+  const { db, ts, addTag } = tagFixture({ installedDaysAgo: 0 });
+  // Tagged for next week: the 28-day baseline ends before the event but its
+  // overlap with collected time is a couple of hours. Dividing by the calendar
+  // span made 2 messages read as 0.5/day.
+  addTag('Next week', ts + 5 * DAY, ts + 7 * DAY);
+  db.run(
+    'INSERT INTO message_hour (hour_ts, channel_id, messages) VALUES (?, ?, ?)',
+    Math.floor((ts - 600) / HOUR) * HOUR,
+    'c1',
+    2,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.status, 'upcoming');
+  assert.ok(tag.baseline.coverage_span_days < 1, 'coverage is the observed slice, not the span');
+  assert.equal(tag.baseline.messages_per_day, null, 'no diluted rate');
+  assert.equal(tag.baseline.joins_per_day, null);
+  assert.match(tag.note, /has not started/);
+});
+
+test('tags with the same start time come back newest-id first, deterministically', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+  const start = ts - 3 * DAY;
+  for (const name of ['A', 'B', 'C']) {
+    db.run(
+      `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+       VALUES(?,?,?,?,?,?,?,?)`,
+      name, start, start + DAY, 'match', null, null, null, ts,
+    );
+  }
+
+  const first = Q.tags(db, cfg(), { limit: 5, ts }).tags.map((t) => t.name);
+  const second = Q.tags(db, cfg(), { limit: 5, ts }).tags.map((t) => t.name);
+  assert.deepEqual(first, ['C', 'B', 'A']);
+  assert.deepEqual(first, second, 'stable across calls');
+});
+
+test('a tag with no joins reports joins_basis null, not "measured"', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+  const start = ts - 2 * HOUR;
+
+  db.run(
+    `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+     VALUES(?,?,?,?,?,?,?,?)`,
+    'Quiet night', start, ts - HOUR, 'match', null, null, null, ts,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.during.joins, 0);
+  assert.equal(tag.during.joins_basis, null, 'no joins is not "measured"');
+});
+
+test('a tag whose joins are part backfill, part measured reports mixed', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+  const start = ts - 3 * DAY;
+  const installed = ts - 2 * DAY;
+  db.setMeta('boot.first', new Date(installed * 1000).toISOString());
+  db.setMeta('backfill.completed', new Date(installed * 1000).toISOString());
+  db.setMeta('backfill.joinedAt.v1', '1');
+
+  db.run(
+    `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+     VALUES(?,?,?,?,?,?,?,?)`,
+    'Spanning install', start, ts, 'tournament', null, null, null, ts,
+  );
+  // One member joined inside the window, known only from the join-date backfill.
+  db.run('INSERT INTO growth_backfill(day_ts, joins) VALUES(?,?)', dayOf(start + HOUR), 1);
+  // One join the collector actually watched happen.
+  db.run('INSERT INTO growth_day(day_ts, joins, leaves) VALUES(?,?,?)', dayOf(ts), 1, 0);
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.during.joins, 2);
+  assert.equal(tag.during.joins_basis, 'mixed');
+});
+
+test('baseline coverage is not floored at one day when nothing was observed', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+  const installed = ts - 2 * HOUR;
+  db.setMeta('boot.first', new Date(installed * 1000).toISOString());
+  db.setMeta('backfill.completed', new Date(installed * 1000).toISOString());
+
+  // Window opened before install, so its 28-day baseline is entirely unobserved.
+  db.run(
+    `INSERT INTO event_tag(name, start_ts, end_ts, kind, prize, participants, notes, created_ts)
+     VALUES(?,?,?,?,?,?,?,?)`,
+    'Before install', ts - 2 * DAY, ts - DAY, 'match', null, null, null, ts,
+  );
+
+  const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
+  assert.equal(tag.baseline.days_observed, 0);
+  assert.equal(tag.baseline.coverage_span_days, 0, 'no baseline coverage, not 1');
+  assert.equal(tag.uplift, null);
+});
+
+test('the empty-dataset caveat names the window the same way as the coverage caveat', () => {
+  const db = openDb(':memory:');
+  const ts = now();
+  db.setMeta('boot.first', new Date(ts * 1000).toISOString());
+
+  const p = Q.summary(db, cfg(), { window: window30, ts });
+  const text = p.caveats.join(' ');
+  assert.match(text, /30-day window/);
+  assert.doesNotMatch(text, /30d window/, 'raw parameter label leaked into prose');
+});
+
+/**
+ * Boot re-adoption when the member cache lost the member. `state.member` is a getter
+ * over guild.members.cache, so it returns null for a swept member; the old code then
+ * skipped that voice state, and a restart left whoever was in a call uncounted until
+ * they muted, moved or left. The data looks identical to an idle server, so this went
+ * unnoticed until a live session stalled right after a redeploy.
+ */
