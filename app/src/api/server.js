@@ -14,6 +14,7 @@ import {
 import * as Q from './queries.js';
 import { retention, RETENTION_PERIODS } from './cohorts.js';
 import { coreConcentration } from './core.js';
+import { channelLifecycle } from './lifecycle.js';
 
 // Both come from config (API_MAX_RESPONSE_KB / AUDIT_FLUSH_SECONDS); these are
 // only the values used when a caller builds the server without a config object.
@@ -140,6 +141,17 @@ export function createApiServer({ config, db, logger, collectors = null }) {
         window: parseWindow(params, '90d'),
         bucket: parseBucket(params, 'week'),
         share: parseFraction(params, 'share', config.analytics.coreShare, { min: 0.02, max: 0.5 }),
+        ts,
+      });
+    },
+
+    // Channel lifecycle. A channel with no figure is `unmeasured`, not empty, and a
+    // channel that was never used is not dormant.
+    'GET /v1/lifecycle': (params, ts) => {
+      rejectUnknownParams(params, ['window', 'limit']);
+      return channelLifecycle(db, config, {
+        window: parseWindow(params, '90d'),
+        limit: parseIntParam(params, 'limit', 25, 1, 100),
         ts,
       });
     },
