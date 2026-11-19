@@ -286,3 +286,27 @@ test('a near-empty first half is described with counts, not a huge percentage', 
   assert.doesNotMatch(row.stage_reason, /%/);
   assert.match(row.stage_reason, /went from 1 to 358/);
 });
+
+test('stage_examples name the channels, ordered by how long they have been quiet', () => {
+  const db = openDb(':memory:');
+  for (let d = 0; d <= 90; d += 1) heartbeat(db, day(d));
+  // Two dormant channels, one quiet for longer than the other.
+  const old = channel(db, { name: 'older' });
+  const older = channel(db, { name: 'oldest' });
+  msgs(db, old, day(50), 30);
+  msgs(db, older, day(70), 30);
+  channel(db, { name: 'unused' });
+  channel(db, { name: 'invisible', visible: 0 });
+
+  const out = channelLifecycle(db, cfg(), { window: window30, ts: TS });
+  const dormant = out.stage_examples.dormant;
+  assert.equal(dormant.total, 2);
+  assert.equal(dormant.truncated, false);
+  // Longest silence first: that is the archive decision in order.
+  assert.deepEqual(dormant.channels.map((c) => c.name), ['oldest', 'older']);
+  assert.ok(dormant.channels[0].days_since_last_activity > dormant.channels[1].days_since_last_activity);
+
+  assert.deepEqual(out.stage_examples.never_used.channels.map((c) => c.name), ['unused']);
+  // An invisible channel is unmeasured, never "unused": it must not appear here.
+  assert.equal(out.stage_examples.never_used.total, 1);
+});

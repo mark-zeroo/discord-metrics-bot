@@ -286,6 +286,32 @@ export function channelLifecycle(
   const byStage = {};
   for (const row of rows) byStage[row.stage] = (byStage[row.stage] ?? 0) + 1;
 
+  // Counts say "43 channels were never used"; this says *which*. Without it the
+  // report is a diagnosis with no referral, and the capped `channels` list cannot
+  // supply it either: that list is sorted by traffic, so the silent channels are
+  // exactly the ones it drops.
+  const EXAMPLE_STAGES = ['dormant', 'declining', 'never_used', 'created_unused', 'low_volume', 'removed'];
+  const exampleLimit = 5;
+  const stageExamples = {};
+  for (const stage of EXAMPLE_STAGES) {
+    const matches = rows.filter((row) => row.stage === stage);
+    stageExamples[stage] = {
+      total: matches.length,
+      truncated: matches.length > exampleLimit,
+      channels: matches
+        // Longest silence first: that is the archive order. (Ascending here put the
+        // most recently quiet channel at the top, which is the one you would keep.)
+        .sort((a, b) => (b.days_since_last_activity ?? -1) - (a.days_since_last_activity ?? -1) || a.name.localeCompare(b.name))
+        .slice(0, exampleLimit)
+        .map((row) => ({
+          id: row.id,
+          name: row.name,
+          messages: row.messages,
+          days_since_last_activity: row.days_since_last_activity,
+        })),
+    };
+  }
+
   // Sorted by traffic, known channels first: the point of a capped list is to show
   // the ones with something at stake. Unmeasured channels sort last with a null,
   // never as zero.
@@ -304,6 +330,7 @@ export function channelLifecycle(
       visibility_unknown: rows.filter((r) => r.visible_to_bot === null).length,
     },
     by_stage: byStage,
+    stage_examples: stageExamples,
     // Channel counts, not people: no suppression floor applies to this summary. The
     // rows themselves carry no per-person data at all.
     rows_returned: returned.length,
