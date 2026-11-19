@@ -200,6 +200,9 @@ function quality(db, config, ts) {
     backfill_complete: Boolean(db.getMeta('backfill.joinedAt.v1')),
     per_member_counters: config.privacy.perMemberCounters,
     per_channel_metrics: config.privacy.perChannelMetrics,
+    // The anonymity floor, repeated wherever quality is reported: a withheld cell
+    // is a policy outcome, not a data gap, and the reader needs the number.
+    min_cell: config.privacy.minCell,
     retention: {
       hourly_days: config.storage.retentionHourlyDays,
       daily_days: config.storage.retentionDailyDays,
@@ -229,7 +232,7 @@ export function meta(db, config, ts = now()) {
     endpoints: [
       '/v1/summary', '/v1/growth', '/v1/activity', '/v1/voice',
       '/v1/events', '/v1/tags', '/v1/engagement', '/v1/presence', '/v1/structure',
-      '/v1/quality',
+      '/v1/retention', '/v1/core', '/v1/lifecycle', '/v1/quality',
     ],
     definitions: {
       messages: 'Count of human-authored guild messages, per hour/day bucket.',
@@ -247,7 +250,34 @@ export function meta(db, config, ts = now()) {
       unique_posters_reason: 'Why unique_posters is unavailable: counters_disabled (PER_MEMBER_COUNTERS is not hmac), beyond_retention (window predates the hourly retention horizon), or no_rows (no per-member rows collected yet, e.g. a fresh install). Null when a figure is present.',
       avg_daily_posters: 'Mean exact daily poster count over days that had activity. Available without per-member rows.',
       concentration: 'How unevenly messaging is distributed across active members.',
-      uplift: `A tagged event window expressed as a multiple of the trailing ${config.analytics.eventBaselineDays}-day per-day baseline.`,
+      retention_dn:
+        'Dn is the share of a join cohort active (one message or one voice second) on the UTC ' +
+        'calendar day n days after that member joined. Exact-day, not cumulative.',
+      core:
+        `The top ${config.analytics.coreShare} of active members by messages in a period. A shape, ` +
+        'not a ranking.',
+      core_churn:
+        'Between two periods: stayed_core, left_core_active (slipped out of the top share but still ' +
+        'posting), left_core_inactive (went silent), left_server_confirmed (saw them leave), joined_core.',
+      channel_stage:
+        'new | growing | steady | declining | dormant | low_volume | never_used | created_unused | ' +
+        'removed | unmeasured. unmeasured means no figure exists, which is not zero.',
+      uplift: `A tagged event window expressed as a multiple of a weekday-matched baseline built from the trailing ${config.analytics.eventBaselineDays} days. Refused rather than quoted when the baseline or the window cannot support it; see uplift_status and refusal_codes.`,
+      uplift_status: 'Per metric: published, or refused with a code (not_started, window_unobserved, window_too_short, baseline_unmeasurable, baseline_too_short, matched_baseline_thin, no_baseline_activity, insufficient_volume, overlapping_event).',
+      suppression:
+        `Any count of people below ${config.privacy.minCell}, or whose complement is, is withheld, and ` +
+        'a second cell is withheld when one withheld cell could be recovered by subtraction. A ' +
+        'withheld value is null with a status, never a zero.',
+    },
+    status_vocabulary: STATUS_LEGEND,
+    privacy: {
+      per_member_counters: config.privacy.perMemberCounters,
+      min_cell: config.privacy.minCell,
+      per_member_grain: ['hour', 'day'],
+      note:
+        'Per-member rows exist only when PER_MEMBER_COUNTERS=hmac. They are keyed by an HMAC of the ' +
+        'Discord id under a key held in env; no endpoint returns a pseudonym, a per-member row, or a ' +
+        'ranking. Cross-tabs of people are suppressed at the floor above.',
     },
     caveats: CAVEATS,
     quality: quality(db, config, ts),
@@ -857,8 +887,41 @@ export function qualityReport(db, config, { ts = now(), voiceStats = null } = {}
       )
     : null;
 
+  const collectorDays = db.get(
+    'SELECT COUNT(*) AS n, MIN(day_ts) AS first, MAX(day_ts) AS last FROM collector_day',
+  );
+
   return {
     ...quality(db, config, ts),
+    // Which days the collector was meant to be watching. A day absent from here is
+    // unobserved, not quiet, and retention/lifecycle use this to tell them apart.
+    collector_days: {
+      recorded: collectorDays?.n ?? 0,
+      first: collectorDays?.first ? isoDate(collectorDays.first) : null,
+      last: collectorDays?.last ? isoDate(collectorDays.last) : null,
+      note:
+        'One heartbeat per UTC day the process ran, written by the maintenance sweep. ' +
+        'A day with no heartbeat was not observed; a day with a heartbeat and no activity was quiet.',
+    },
+    privacy: {
+      min_cell: config.privacy.minCell,
+      per_member_counters: config.privacy.perMemberCounters,
+      suppression:
+        `Counts of people below ${config.privacy.minCell}, and counts whose complement is below it, ` +
+        'are withheld; totals that would recover a withheld cell are withheld too. Withheld values ' +
+        'are null with a status from /v1/meta status_vocabulary.',
+      per_member_rows: {
+        tables: config.privacy.perMemberCounters === 'hmac' ? ['member_hour', 'member_day', 'member_tenure'] : [],
+        retention_days:
+          config.privacy.perMemberCounters === 'hmac'
+            ? {
+                member_hour: config.storage.retentionHourlyDays,
+                member_day: config.storage.retentionDailyDays,
+                member_tenure_open: 'kept while the membership is open',
+              }
+            : null,
+      },
+    },
     coverage: channelCoverage
       ? {
           structure_observed_at: iso(structureTs),

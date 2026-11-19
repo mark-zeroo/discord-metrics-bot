@@ -437,3 +437,73 @@ test('quality says so explicitly when collectors are absent', async () => {
   assert.equal(body.voice_collector.available, false);
   assert.match(body.voice_collector.reason, /without collectors/);
 });
+
+// ------------------------------------- cohort retention / core / lifecycle
+
+test('retention is wired, and its parameters are validated rather than ignored', async () => {
+  const ok = await get('/v1/retention?cohort=day&periods=1,7,30&window=365d&limit=5');
+  assert.equal(ok.status, 200);
+  const body = await ok.json();
+  // This instance runs with PER_MEMBER_COUNTERS=off, so the answer is a
+  // configuration state with a remedy — not an empty cohort table.
+  assert.equal(body.available, false);
+  assert.match(body.reason, /PER_MEMBER_COUNTERS/);
+  assert.ok(body.what_would_help);
+
+  for (const bad of [
+    '/v1/retention?cohort=year',
+    '/v1/retention?periods=45',
+    '/v1/retention?periods=1,x',
+    '/v1/retention?limit=0',
+    '/v1/retention?sql=select',
+  ]) {
+    assert.equal((await get(bad)).status, 400, `${bad} should be a 400`);
+  }
+});
+
+test('core share is a bounded decimal fraction, and nothing else gets through', async () => {
+  const ok = await get('/v1/core?window=90d&bucket=week&share=0.3');
+  assert.equal(ok.status, 200);
+  const body = await ok.json();
+  assert.equal(body.share, 0.3);
+
+  for (const bad of ['/v1/core?share=20', '/v1/core?share=0.9', '/v1/core?share=abc', '/v1/core?top=3']) {
+    assert.equal((await get(bad)).status, 400, `${bad} should be a 400`);
+  }
+});
+
+test('lifecycle is wired and refuses to invent a channel list', async () => {
+  const res = await get('/v1/lifecycle?window=90d&limit=10');
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  // No structure collected in this fixture: unavailable with a reason, never an
+  // empty list that reads as "the server has no channels".
+  assert.equal(body.available, false);
+  assert.match(body.reason, /structure/);
+
+  assert.equal((await get('/v1/lifecycle?limit=101')).status, 400);
+  assert.equal((await get('/v1/lifecycle?detail=full')).status, 400);
+});
+
+test('meta publishes the suppression vocabulary and the privacy floor', async () => {
+  const meta = await (await get('/v1/meta')).json();
+  for (const path of ['/v1/retention', '/v1/core', '/v1/lifecycle']) {
+    assert.ok(meta.endpoints.includes(path), `${path} missing from endpoints`);
+  }
+  assert.equal(typeof meta.privacy.min_cell, 'number');
+  assert.ok(meta.status_vocabulary.suppressed_small_count);
+  assert.ok(meta.status_vocabulary.unmeasured);
+  assert.match(meta.definitions.suppression, /withheld/);
+  // The definition of Dn has to say exactly which day it means; "retention"
+  // alone is ambiguous between exact-day and cumulative.
+  assert.match(meta.definitions.retention_dn, /UTC calendar day n days after/);
+});
+
+test('quality reports the anonymity floor and which days were observed', async () => {
+  const body = await (await get('/v1/quality')).json();
+  assert.equal(typeof body.privacy.min_cell, 'number');
+  assert.match(body.privacy.suppression, /below/);
+  assert.ok(body.collector_days);
+  assert.equal(typeof body.collector_days.recorded, 'number');
+  assert.match(body.collector_days.note, /not observed/);
+});

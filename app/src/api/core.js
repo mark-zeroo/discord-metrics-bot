@@ -102,6 +102,11 @@ export function coreConcentration(
         'PER_MEMBER_COUNTERS is off, so there are no per-member rows and no core to describe. ' +
         'This is a configuration state, not a quiet server.',
       what_would_help: 'Set PER_MEMBER_COUNTERS=hmac with HMAC_KEY and let member_day fill forward.',
+      window: window.label,
+      bucket,
+      share,
+      periods: [],
+      transitions: [],
       status_legend: legend,
       quality: quality(db, config, ts),
     };
