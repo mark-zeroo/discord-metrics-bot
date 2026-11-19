@@ -1,4 +1,5 @@
 import { DAY, hourOf, dayOf } from '../time.js';
+import { addMemberDayMessages } from '../tenure.js';
 
 /**
  * Message *counting*. No content, no attachments, no embeds, no author id is
@@ -32,6 +33,16 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
   const memberHours = new Map();
 
   /**
+   * day -> Map<key, messageCount>. The daily twin of memberHours, for retention.
+   *
+   * member_hour is pruned with hourly retention, so a D30 retention question asked
+   * about a cohort older than the hourly horizon had no activity rows left to
+   * answer it. Keeping a per-member *day* row (one per member per active day) makes
+   * the long-range question answerable without keeping every hour forever.
+   */
+  const memberDays = new Map();
+
+  /**
    * What *this process* has already persisted, per bucket and key.
    *
    * The in-memory counters above start at zero on every boot, so a flush that
@@ -45,6 +56,7 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
   const persistedHours = new Map(); // hour -> Map<channelId, n>
   const persistedDays = new Map(); // day  -> Map<channelId, n>
   const persistedMembers = new Map(); // hour -> Map<key, n>
+  const persistedMemberDays = new Map(); // day -> Map<key, n>
 
   const bootTs = Math.floor(Date.now() / 1000);
   const bootDay = dayOf(bootTs);
@@ -152,6 +164,13 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
           memberHours.set(h, byKey);
         }
         byKey.set(key, (byKey.get(key) ?? 0) + 1);
+
+        let byDay = memberDays.get(d);
+        if (!byDay) {
+          byDay = new Map();
+          memberDays.set(d, byDay);
+        }
+        byDay.set(key, (byDay.get(key) ?? 0) + 1);
       }
 
       received += 1;
@@ -164,6 +183,7 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
         pendingHours: hours.size,
         pendingDays: days.size,
         perMemberRows: identity.persistable,
+        pendingMemberDays: memberDays.size,
       };
     },
 
@@ -297,6 +317,19 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
             markPersisted(persistedMembers, h, key, count);
           }
         }
+
+        // Per-member day rows. Delta-based like the hour rows, but with no
+        // partial-day accumulation: a restart can only undercount the day, and
+        // the day's own `partial` flag on message_day is what the API reads to
+        // mark retention measured on a partly observed day.
+        for (const [d, byKey] of memberDays) {
+          for (const [key, count] of byKey) {
+            const delta = deltaFor(persistedMemberDays, d, key, count);
+            if (delta === null) continue;
+            addMemberDayMessages(db, { key, dayTs: d, delta });
+            markPersisted(persistedMemberDays, d, key, count);
+          }
+        }
       });
 
       // Keep the trailing hour in RAM so a late flush can still correct it.
@@ -305,6 +338,7 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
       for (const h of posterHours.keys()) if (h < currentHour - 3600) posterHours.delete(h);
       for (const h of memberHours.keys()) if (h < currentHour - 3600) memberHours.delete(h);
       for (const d of posterDays.keys()) if (d < bootDay - DAY) posterDays.delete(d);
+      for (const d of memberDays.keys()) if (d < bootDay - DAY) memberDays.delete(d);
 
       // Pruned on a stricter schedule than the counters they mirror. Dropping a
       // "written" marker while its bucket is still in RAM would make the next
@@ -312,6 +346,7 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
       for (const h of persistedHours.keys()) if (h < currentHour - 3 * 3600) persistedHours.delete(h);
       for (const h of persistedMembers.keys()) if (h < currentHour - 3 * 3600) persistedMembers.delete(h);
       for (const d of persistedDays.keys()) if (d < bootDay - 2 * DAY) persistedDays.delete(d);
+      for (const d of persistedMemberDays.keys()) if (d < bootDay - 2 * DAY) persistedMemberDays.delete(d);
     },
 
     reset() {
@@ -320,9 +355,11 @@ export function createMessageCollector({ identity, excludedRoleIds, perChannel }
       posterHours.clear();
       posterDays.clear();
       memberHours.clear();
+      memberDays.clear();
       persistedHours.clear();
       persistedDays.clear();
       persistedMembers.clear();
+      persistedMemberDays.clear();
       received = 0;
       ignored = 0;
     },

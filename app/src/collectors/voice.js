@@ -1,4 +1,5 @@
 import { DAY, HOUR, hourOf, dayOf } from '../time.js';
+import { addMemberDayVoice } from '../tenure.js';
 
 const MAX_SESSION_SECONDS = 12 * HOUR; // a stuck session cannot bill a whole day
 
@@ -47,6 +48,9 @@ export function createVoiceCollector({
   /** hour -> Map<key, seconds>. Only populated when identity.persistable. */
   const memberHours = new Map();
 
+  /** day -> Map<key, seconds>. Daily twin of memberHours, for retention. */
+  const memberDays = new Map();
+
   /**
    * What this process has already written, per bucket. Same reasoning as the
    * message collector: the counters above restart at zero, so a flush that
@@ -56,6 +60,7 @@ export function createVoiceCollector({
   const persistedHours = new Map(); // hour -> Map<channelId, seconds>
   const persistedDays = new Map(); // day  -> Map<channelId, seconds>
   const persistedMembers = new Map(); // hour -> Map<key, seconds>
+  const persistedMemberDays = new Map(); // day -> Map<key, seconds>
 
   /** The one place that decides whether a voice state counts as participation. */
   function eligible(channelId, state) {
@@ -147,6 +152,14 @@ export function createVoiceCollector({
           memberHours.set(h, byKey);
         }
         byKey.set(key, (byKey.get(key) ?? 0) + slice);
+
+        const dKey = dayOf(cursor);
+        let byDay = memberDays.get(dKey);
+        if (!byDay) {
+          byDay = new Map();
+          memberDays.set(dKey, byDay);
+        }
+        byDay.set(key, (byDay.get(key) ?? 0) + slice);
       }
 
       budget -= slice;
@@ -273,6 +286,7 @@ export function createVoiceCollector({
         countMode,
         pendingHours: hours.size,
         pendingDays: days.size,
+        pendingMemberDays: memberDays.size,
         lastSeedStates,
         lastSeedUnknown,
       };
@@ -371,17 +385,31 @@ export function createVoiceCollector({
             markPersisted(persistedMembers, h, key, seconds);
           }
         }
+
+        // Per-member day rows, for cohort retention. Delta-based, like the hour
+        // rows; voice_s is added to whatever the message collector already wrote
+        // for the same member and day.
+        for (const [d, byKey] of memberDays) {
+          for (const [key, seconds] of byKey) {
+            const delta = deltaFor(persistedMemberDays, d, key, seconds);
+            if (delta === null) continue;
+            addMemberDayVoice(db, { key, dayTs: d, delta });
+            markPersisted(persistedMemberDays, d, key, seconds);
+          }
+        }
       });
 
       for (const h of hours.keys()) if (h < currentHour - 3600) hours.delete(h);
       for (const d of days.keys()) if (d < bootDay - DAY) days.delete(d);
       for (const h of memberHours.keys()) if (h < currentHour - 3600) memberHours.delete(h);
+      for (const d of memberDays.keys()) if (d < bootDay - DAY) memberDays.delete(d);
 
       // Stricter schedule than the counters they mirror: dropping a marker
       // while its bucket is still in RAM would re-add the running total.
       for (const h of persistedHours.keys()) if (h < currentHour - 3 * 3600) persistedHours.delete(h);
       for (const h of persistedMembers.keys()) if (h < currentHour - 3 * 3600) persistedMembers.delete(h);
       for (const d of persistedDays.keys()) if (d < bootDay - 2 * DAY) persistedDays.delete(d);
+      for (const d of persistedMemberDays.keys()) if (d < bootDay - 2 * DAY) persistedMemberDays.delete(d);
     },
 
     /** Called once at boot: in-flight sessions cannot survive a restart. */
@@ -399,9 +427,11 @@ export function createVoiceCollector({
       hours.clear();
       days.clear();
       memberHours.clear();
+      memberDays.clear();
       persistedHours.clear();
       persistedDays.clear();
       persistedMembers.clear();
+      persistedMemberDays.clear();
     },
   };
 }

@@ -1,4 +1,5 @@
 import { DAY, HOUR, hourOf, dayOf } from '../time.js';
+import { recordJoin, recordLeave } from '../tenure.js';
 
 /**
  * Joins, leaves and the periodic member/boost snapshot.
@@ -8,10 +9,20 @@ import { DAY, HOUR, hourOf, dayOf } from '../time.js';
  * counter increment; the departing member's identity is gone before the next
  * statement runs.
  */
-export function createMemberCollector() {
+export function createMemberCollector({ identity = null } = {}) {
   /** hour -> {joins, leaves, members, bots} */
   const hours = new Map();
   const days = new Map();
+
+  /**
+   * Membership spans, buffered until the next flush. Joins carry Discord's own
+   * joinedAt so a member added while the bot is running gets the same cohort they
+   * would have had from the backfill. Only collected when identity.persistable:
+   * a per-member join record is exactly the kind of row PER_MEMBER_COUNTERS=off
+   * promises not to keep.
+   */
+  const joinEvents = []; // {key, joinedTs}
+  const leaveEvents = []; // {key, ts}
 
   const bootTs = Math.floor(Date.now() / 1000);
   const bootDay = dayOf(bootTs);
@@ -40,10 +51,20 @@ export function createMemberCollector() {
 
     onJoin(member, { now = Math.floor(Date.now() / 1000) } = {}) {
       note(now, 'joins', member.user?.bot === true);
+      if (!identity?.persistable || member.user?.bot) return;
+      const joinedAt = member.joinedTimestamp ?? member.joinedAt ?? null;
+      const joinedTs = joinedAt instanceof Date
+        ? Math.floor(joinedAt.getTime() / 1000)
+        : Number.isFinite(Number(joinedAt))
+          ? Math.floor(Number(joinedAt) / 1000)
+          : now;
+      joinEvents.push({ key: identity.keyFor(member.user.id), joinedTs });
     },
 
     onLeave(member, { now = Math.floor(Date.now() / 1000) } = {}) {
       note(now, 'leaves', member.user?.bot === true);
+      if (!identity?.persistable || member.user?.bot) return;
+      leaveEvents.push({ key: identity.keyFor(member.user.id), ts: now });
     },
 
     /**
@@ -65,7 +86,12 @@ export function createMemberCollector() {
     },
 
     stats() {
-      return { ...lastCounts, pendingHours: hours.size };
+      return {
+        ...lastCounts,
+        pendingHours: hours.size,
+        pendingJoinEvents: joinEvents.length,
+        pendingLeaveEvents: leaveEvents.length,
+      };
     },
 
     flush(db, now = Math.floor(Date.now() / 1000)) {
@@ -109,7 +135,17 @@ export function createMemberCollector() {
             d === bootDay && bootTs > d ? 1 : 0,
           );
         }
+
+        // Membership spans live in the same transaction as the counters: a join
+        // counted but not attributed (or the reverse) would make the cohort table
+        // disagree with the growth series, and there is no way to tell which is
+        // right after the fact.
+        for (const event of joinEvents) recordJoin(db, { key: event.key, joinedTs: event.joinedTs, ts: now });
+        for (const event of leaveEvents) recordLeave(db, { key: event.key, ts: event.ts });
       });
+
+      joinEvents.length = 0;
+      leaveEvents.length = 0;
 
       for (const h of hours.keys()) if (h < currentHour - HOUR) hours.delete(h);
       for (const d of days.keys()) if (d < bootDay - DAY) days.delete(d);
@@ -118,6 +154,8 @@ export function createMemberCollector() {
     reset() {
       hours.clear();
       days.clear();
+      joinEvents.length = 0;
+      leaveEvents.length = 0;
     },
   };
 }

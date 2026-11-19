@@ -149,6 +149,43 @@ const SCHEMA = [
      PRIMARY KEY (hour_ts, user_hmac)
    ) WITHOUT ROWID`,
 
+  // ------------------------------------------------- per-member daily activity
+  // member_hour answers "who was active this hour" and is pruned with hourly
+  // retention. Retention questions are asked in days, so they need a daily grain
+  // that outlives the hourly sweep: one row per active member per active day.
+  // Only members who did something get a row (absence is inactivity), which keeps
+  // this table far smaller than members × days.
+  //
+  // Written only when PER_MEMBER_COUNTERS=hmac, like member_hour. user_hmac is an
+  // HMAC of the Discord id under a key held in env, never the id itself.
+  `CREATE TABLE IF NOT EXISTS member_day (
+     day_ts    INTEGER NOT NULL,
+     user_hmac TEXT    NOT NULL,
+     messages  INTEGER NOT NULL DEFAULT 0,
+     voice_s   INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (day_ts, user_hmac)
+   ) WITHOUT ROWID`,
+
+  // One row per *membership span*, not per member, because a rejoin is a new
+  // cohort. A single joined_ts per member silently attributes a rejoin's D1
+  // retention to activity from the previous membership, which is worse than not
+  // measuring it. joined_ts comes from Discord's joinedAt (backfilled once and
+  // then recorded live); left_ts is only known for departures this collector
+  // actually observed, so an untracked departure reads as "went quiet".
+  `CREATE TABLE IF NOT EXISTS member_tenure (
+     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+     user_hmac   TEXT    NOT NULL,
+     joined_ts   INTEGER NOT NULL,
+     left_ts     INTEGER,
+     source      TEXT    NOT NULL DEFAULT 'joined_at',
+     recorded_ts INTEGER NOT NULL,
+     UNIQUE (user_hmac, joined_ts)
+   )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_member_day_hmac ON member_day(user_hmac, day_ts)`,
+  `CREATE INDEX IF NOT EXISTS idx_member_tenure_hmac ON member_tenure(user_hmac)`,
+  `CREATE INDEX IF NOT EXISTS idx_member_tenure_joined ON member_tenure(joined_ts)`,
+
   `CREATE TABLE IF NOT EXISTS api_audit (
      id       INTEGER PRIMARY KEY AUTOINCREMENT,
      ts       INTEGER NOT NULL,

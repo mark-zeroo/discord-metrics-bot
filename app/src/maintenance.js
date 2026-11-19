@@ -56,6 +56,24 @@ export function createMaintenance({ db, config, collectors, bot, logger }) {
       del('DELETE FROM voice_hour   WHERE hour_ts < ?', hourlyCutoff);
       del('DELETE FROM growth_hour  WHERE hour_ts < ?', hourlyCutoff);
       del('DELETE FROM member_hour  WHERE hour_ts < ?', hourlyCutoff);
+      // Per-member daily rows follow daily retention, like the aggregates they
+      // mirror. They are per-person, so they must not outlive it.
+      del('DELETE FROM member_day   WHERE day_ts < ?', dailyCutoff);
+      // Closed membership spans older than daily retention go too: cohort
+      // retention cannot be measured there anyway (member_day is gone), and a
+      // per-person join record is exactly what should not accumulate forever.
+      // Open spans are kept regardless of age — they belong to current members,
+      // and deleting one would silently drop that member from every future cohort.
+      // Two placeholders, so this cannot go through the single-parameter `del`
+      // helper: binding one cutoff and leaving the other unset throws, and a
+      // throw here aborts the whole sweep.
+      n += Number(
+        db.run(
+          'DELETE FROM member_tenure WHERE left_ts IS NOT NULL AND left_ts < ? AND joined_ts < ?',
+          dailyCutoff,
+          dailyCutoff,
+        ).changes ?? 0,
+      );
       del('DELETE FROM poster_hour  WHERE hour_ts < ?', hourlyCutoff);
       del('DELETE FROM snapshot     WHERE ts < ?', hourlyCutoff);
       del('DELETE FROM message_day  WHERE day_ts < ?', dailyCutoff);

@@ -10,7 +10,7 @@ import { createMemberCollector } from './collectors/members.js';
 import { createBot } from './bot.js';
 import { createApiServer } from './api/server.js';
 import { createMaintenance } from './maintenance.js';
-import { backfillJoinHistoryWithRetry } from './backfill.js';
+import { backfillJoinHistoryWithRetry, backfillMemberTenureWithRetry } from './backfill.js';
 import { dayOf, isoDate } from './time.js';
 
 /**
@@ -90,7 +90,10 @@ async function main() {
       afkChannelId: null, // resolved once the guild is available
       countMode: config.privacy.voiceCountMode,
     }),
-    members: createMemberCollector(),
+    // identity so joins and leaves become membership spans, but only in hmac mode;
+    // with counters off the collector still counts joins and stores nothing about
+    // who. Cohort retention is unavailable there and says so.
+    members: createMemberCollector({ identity }),
   };
 
   const api = createApiServer({ config, db, logger, collectors });
@@ -159,7 +162,7 @@ async function main() {
   // One-shot: reconstruct the join curve from member join dates. Deliberately not
   // awaited — it retries with real delays, and blocking startup on it would push
   // `ready` (and the first flush) out by minutes on a throttled guild.
-  void backfillJoinHistoryWithRetry({ guild, db, logger }).then((result) => {
+  const joinBackfill = backfillJoinHistoryWithRetry({ guild, db, logger }).then((result) => {
     if (shuttingDown) return;
     try {
       if (result.ok && !result.skipped) db.setMeta('backfill.completed', new Date().toISOString());
@@ -167,6 +170,26 @@ async function main() {
       logger.debug('could not record backfill completion', { error: err?.message });
     }
   });
+
+  // Second one-shot pass: the same member listing, but keeping one pseudonymised
+  // membership span per person so cohorts exist.
+  //
+  // Chained off the first pass rather than run beside it: both page the same REST
+  // endpoint, and two concurrent listers against one rate limit is how the second
+  // one gets throttled into a retry loop. `finally` so a failed aggregate backfill
+  // does not also cost the cohort history — they are independent records, and an
+  // empty growth curve is no reason to have no cohorts.
+  void joinBackfill
+    .finally(() => {
+      if (shuttingDown) return null;
+      return backfillMemberTenureWithRetry({ guild, db, identity, logger });
+    })
+    .then((result) => {
+      if (result?.ok && result.skipped) {
+        logger.debug('member tenure backfill skipped', { reason: result.reason });
+      }
+    })
+    .catch((err) => logger.warn('member tenure backfill crashed', { error: err?.message ?? String(err) }));
 
   const shutdown = async (signal) => {
     shuttingDown = true;

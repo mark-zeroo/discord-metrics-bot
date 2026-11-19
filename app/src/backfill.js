@@ -1,6 +1,8 @@
 import { dayOf, isoDate } from './time.js';
+import { recordJoin } from './tenure.js';
 
 const BACKFILL_FLAG = 'backfill.joinedAt.v1';
+const TENURE_FLAG = 'backfill.member_tenure.v1';
 
 // REST member listing is paginated at 1000 per page. 100 pages is 100k members:
 // far past any guild this is meant for, and a hard stop if `after` ever fails to
@@ -120,6 +122,66 @@ export async function backfillJoinHistory({ guild, db, logger, force = false }) 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * One row per current member's membership span, so cohort retention has a cohort.
+ *
+ * The aggregate join backfill above throws the join *date of a person* away on
+ * purpose: growth curves do not need to know who joined when. Retention does, so
+ * this pass keeps a pseudonymised span per member — which is strictly more
+ * per-member data than before, and therefore only runs when
+ * PER_MEMBER_COUNTERS=hmac. With counters off it is a no-op that writes nothing and
+ * sets no flag.
+ *
+ * Deliberately separate from backfillJoinHistory: upgrading an existing install
+ * already has the aggregate flag set, so hanging this off the same flag would mean
+ * it never ran for anyone who upgrades — the exact population that has history
+ * worth measuring.
+ */
+export async function backfillMemberTenure({ guild, db, identity, logger, force = false }) {
+  if (!identity?.persistable) {
+    return { skipped: true, reason: 'per_member_counters_off' };
+  }
+  if (!force && db.getMeta(TENURE_FLAG)) {
+    return { skipped: true, reason: 'already_complete' };
+  }
+
+  const startedAt = Date.now();
+  const members = await collectMembers(guild, logger);
+  if (members.size === 0) {
+    // Same rule as the join backfill: an empty page is a failed read, not a server
+    // with no members. Leaving the flag unset means the next boot retries.
+    throw new Error('member listing returned nothing for the tenure backfill');
+  }
+
+  let written = 0;
+  let humanos = 0;
+  db.transaction(() => {
+    for (const member of members.values()) {
+      if (member.user?.bot) continue;
+      humanos += 1;
+      const joinedAt = member.joinedAt ?? member.joinedTimestamp;
+      if (!joinedAt) continue;
+      const joinedTs = Math.floor(new Date(joinedAt).getTime() / 1000);
+      if (!Number.isFinite(joinedTs) || joinedTs <= 0) continue;
+      if (recordJoin(db, {
+        key: identity.keyFor(member.user.id),
+        joinedTs,
+        source: 'backfill',
+      })) written += 1;
+    }
+    db.setMeta(TENURE_FLAG, new Date().toISOString());
+  });
+
+  logger.info('member tenure backfill complete', {
+    members: humanos,
+    spans: written,
+    bots: members.size - humanos,
+    ms: Date.now() - startedAt,
+  });
+  return { skipped: false, members: humanos, spans: written };
+}
+
+
+/**
  * Backfill with bounded retries, so a transient Discord throttle does not leave
  * the join curve empty until the next deploy.
  *
@@ -130,6 +192,37 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Returns a result rather than throwing: a missing join curve is a degraded
  * feature, not a reason to take the collector down.
  */
+export async function backfillMemberTenureWithRetry({
+  guild,
+  db,
+  identity,
+  logger,
+  attempts = 3,
+  delays = [30_000, 120_000],
+  sleep = defaultSleep,
+  force = false,
+}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return { ok: true, ...(await backfillMemberTenure({ guild, db, identity, logger, force })) };
+    } catch (err) {
+      const message = err?.message ?? String(err);
+      if (attempt === attempts) {
+        // Degraded feature, not a reason to stop collecting: the growth curve and
+        // everything else still work, and the next boot retries.
+        logger.warn('member tenure backfill failed; cohort retention stays unavailable', {
+          attempt,
+          attempts,
+          error: message,
+        });
+        return { ok: false, error: message, attempts };
+      }
+      await sleep(delays[attempt - 1] ?? delays[delays.length - 1] ?? 60_000);
+    }
+  }
+  return { ok: false, error: 'unreachable', attempts };
+}
+
 export async function backfillJoinHistoryWithRetry({
   guild,
   db,

@@ -126,6 +126,19 @@ export function loadConfig(env = process.env) {
     throw new ConfigError('EVENT_BASELINE_NOISY_DAYS cannot exceed EVENT_BASELINE_DAYS');
   }
 
+  // The anonymity floor for any published cross-tab of people. It is validated
+  // here because a value of 1 silently turns every guard off while still
+  // appearing configured, and 0 would make `count < k` impossible to satisfy.
+  const minCell = int(env, 'PRIVACY_MIN_CELL', 10, { min: 2, max: 1000 });
+
+  // Core size as a fraction of active members. 0.2 is the "top fifth", which on
+  // a community server is roughly the regulars. Bounded well below 1 because a
+  // "core" of everyone measures nothing.
+  const coreShare = Number(str(env, 'CORE_SHARE', { fallback: '0.2' }));
+  if (!Number.isFinite(coreShare) || coreShare <= 0.02 || coreShare >= 0.5) {
+    throw new ConfigError('CORE_SHARE must be a number between 0.02 and 0.5');
+  }
+
   return {
     discord: { token: discordToken, guildId },
     api: {
@@ -156,6 +169,11 @@ export function loadConfig(env = process.env) {
       // sit in a lobby while playing on a phone. 'unmuted' requires an unmuted,
       // undeafened member, which measures something closer to conversation.
       voiceCountMode: str(env, 'VOICE_COUNT_MODE', { fallback: 'present' }).toLowerCase(),
+      // Minimum cell size k for every published cross-tab of people (cohort
+      // retention, core churn, engagement bands). Cells below it are withheld,
+      // and totals that would let a withheld cell be recovered by subtraction
+      // are withheld too. Never a display rounding knob: it is the anonymity floor.
+      minCell,
     },
     runtime: {
       flushIntervalMs: int(env, 'FLUSH_INTERVAL_MS', 15000, { min: 1000, max: 300000 }),
@@ -171,7 +189,26 @@ export function loadConfig(env = process.env) {
     analytics: {
       eventBaselineDays,
       eventBaselineNoisyDays,
+      // How many complete periods the core trend looks back over, and what
+      // fraction of active members counts as "core".
+      corePeriods: int(env, 'CORE_PERIODS', 8, { min: 2, max: 52 }),
+      coreShare,
+      // Core concentration is only reported as a direction with this many
+      // published periods behind it: two points are a line through noise.
+      coreMinPeriodsForTrend: 4,
       presenceStaleSeconds: int(env, 'PRESENCE_STALE_MINUTES', 30, { min: 1, max: 1440 }) * 60,
+      // Channel lifecycle thresholds. A channel is dormant after this many days
+      // without traffic, and needs this many messages in the window before a
+      // growing/declining call is made at all (otherwise a 3-message channel
+      // reads as "in decline" rather than "too quiet to say").
+      channelDormantDays: int(env, 'CHANNEL_DORMANT_DAYS', 21, { min: 2, max: 365 }),
+      channelMinMessages: int(env, 'CHANNEL_MIN_MESSAGES', 20, { min: 1, max: 100000 }),
+      // Uplift refuses to divide tiny numbers. Below this many messages in the
+      // event window or in the baseline, the ratio is noise wearing a decimal.
+      eventUpliftMinMessages: int(env, 'EVENT_UPLIFT_MIN_MESSAGES', 30, { min: 0, max: 100000 }),
+      // How many baseline days per weekday are needed before a weekday-matched
+      // baseline is trusted. 28 baseline days gives 4 per weekday.
+      eventMatchedMinDays: int(env, 'EVENT_MATCHED_MIN_DAYS', 3, { min: 1, max: 52 }),
     },
   };
 }
