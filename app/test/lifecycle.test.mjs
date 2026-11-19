@@ -197,6 +197,18 @@ test('coverage says when the collector was not running for the window', () => {
   assert.match(out.coverage.note, /lower bound/);
 });
 
+test('a channel deleted before the window is still removed, not steady', () => {
+  const db = openDb(':memory:');
+  for (let d = 0; d <= 90; d += 1) heartbeat(db, day(d));
+  const id = channel(db, { name: 'closed-long-ago', deleted: day(80) });
+  msgs(db, id, day(85), 40);
+
+  const out = channelLifecycle(db, cfg(), { window: window30, ts: TS });
+  const row = stageOf(out, 'closed-long-ago');
+  assert.equal(row.stage, 'removed');
+  assert.match(row.stage_reason, /deleted before the window/);
+});
+
 test('a channel with no structure yet is unavailable, not empty', () => {
   const db = openDb(':memory:');
   const out = channelLifecycle(db, cfg(), { window: window30, ts: TS });

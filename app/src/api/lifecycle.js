@@ -177,11 +177,15 @@ export function channelLifecycle(
 
     let stage;
     let stageReason;
-    if (deletedTs && deletedTs >= from) {
+    if (deletedTs) {
+      // Deleted at some point, inside this window or before it. It is a removed
+      // channel either way: classifying an old deletion as "steady" or "never used"
+      // would invite someone to go looking for a channel that no longer exists.
       stage = 'removed';
+      const when = deletedTs >= from ? 'deleted inside the window' : 'deleted before the window';
       stageReason = lastEver
-        ? `deleted on ${isoDate(deletedTs)}, last activity ${isoDate(lastEver)}`
-        : `deleted on ${isoDate(deletedTs)} without ever recording activity`;
+        ? `${when} on ${isoDate(deletedTs)}, last activity ${isoDate(lastEver)}`
+        : `${when} on ${isoDate(deletedTs)}, without ever recording activity`;
     } else if (!activityKnown) {
       stage = 'unmeasured';
       stageReason =
