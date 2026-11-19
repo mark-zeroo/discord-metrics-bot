@@ -191,3 +191,27 @@ test('openDb reports whether the file already existed', () => {
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('a weekday floor longer than the baseline is refused at boot', () => {
+  // 40 baseline days cannot hold 40 of one weekday: every uplift would refuse for
+  // what looks like a data problem rather than a typo.
+  assert.throws(
+    () => loadConfig({ ...BASE_ENV, EVENT_MATCHED_MIN_DAYS: '40' }),
+    /EVENT_MATCHED_MIN_DAYS cannot exceed EVENT_BASELINE_DAYS/,
+  );
+  const ok = loadConfig({ ...BASE_ENV, EVENT_BASELINE_DAYS: '42', EVENT_MATCHED_MIN_DAYS: '40' });
+  assert.equal(ok.analytics.eventMatchedMinDays, 40);
+});
+
+test('the anonymity floor cannot be configured away', () => {
+  // 1 would turn every guard off while still looking configured.
+  assert.throws(() => loadConfig({ ...BASE_ENV, PRIVACY_MIN_CELL: '1' }), ConfigError);
+  assert.throws(() => loadConfig({ ...BASE_ENV, PRIVACY_MIN_CELL: '0' }), ConfigError);
+  assert.equal(loadConfig({ ...BASE_ENV, PRIVACY_MIN_CELL: '5' }).privacy.minCell, 5);
+});
+
+test('core share is bounded so it cannot describe everybody', () => {
+  assert.throws(() => loadConfig({ ...BASE_ENV, CORE_SHARE: '0.9' }), ConfigError);
+  assert.throws(() => loadConfig({ ...BASE_ENV, CORE_SHARE: 'nope' }), ConfigError);
+  assert.equal(loadConfig({ ...BASE_ENV, CORE_SHARE: '0.3' }).analytics.coreShare, 0.3);
+});

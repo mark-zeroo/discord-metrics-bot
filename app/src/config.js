@@ -130,6 +130,13 @@ export function loadConfig(env = process.env) {
   // here because a value of 1 silently turns every guard off while still
   // appearing configured, and 0 would make `count < k` impossible to satisfy.
   const minCell = int(env, 'PRIVACY_MIN_CELL', 10, { min: 2, max: 1000 });
+  const eventMatchedMinDays = int(env, 'EVENT_MATCHED_MIN_DAYS', 3, { min: 1, max: 52 });
+  // A weekday cannot appear more often than the baseline is long, so a floor above
+  // the window length (28 days holds 4 of each weekday) makes every uplift refuse
+  // for a reason that looks like a data problem. Fail at boot instead.
+  if (eventMatchedMinDays > eventBaselineDays) {
+    throw new ConfigError('EVENT_MATCHED_MIN_DAYS cannot exceed EVENT_BASELINE_DAYS');
+  }
 
   // Core size as a fraction of active members. 0.2 is the "top fifth", which on
   // a community server is roughly the regulars. Bounded well below 1 because a
@@ -208,7 +215,7 @@ export function loadConfig(env = process.env) {
       eventUpliftMinMessages: int(env, 'EVENT_UPLIFT_MIN_MESSAGES', 30, { min: 0, max: 100000 }),
       // How many baseline days per weekday are needed before a weekday-matched
       // baseline is trusted. 28 baseline days gives 4 per weekday.
-      eventMatchedMinDays: int(env, 'EVENT_MATCHED_MIN_DAYS', 3, { min: 1, max: 52 }),
+      eventMatchedMinDays,
     },
   };
 }
