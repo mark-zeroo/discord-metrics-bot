@@ -1004,8 +1004,8 @@ model or a leaked token leaves a trail.
 
 ## Slash commands
 
-The bot also answers four read-only slash commands in the guild, so members do not
-need the API token (or an LLM) to see the same numbers. They read the query layer
+The bot also answers read-only slash commands in the guild, so members do not need
+the API token (or an LLM) to see the same numbers. They read the query layer
 directly — same code the API serves, no HTTP hop — and like the API they cannot
 change collection.
 
@@ -1015,8 +1015,24 @@ change collection.
 | `/stats activity` | `window`, `channels` (1–10) | messages in the window plus the busiest channels |
 | `/stats growth` | `window` | joins, leaves, net, members now, tenure shares |
 | `/stats voice` | `window` | voice hours (per `VOICE_COUNT_MODE`) and the busiest voice channels |
+| `/stats retention` | `window`, `cohort` (`week`/`day`) | pooled D1/D7/D30 and the newest cohort |
+| `/stats core` | `window` | latest period's concentration, core churn and the trend |
+| `/stats channels` | `window`, `limit` (1–10) | lifecycle stages, dormant and never-used channels, coverage gap |
+| `/stats events` | `limit` (1–5) | recent tags with their activity and uplift, or why uplift was refused |
 
-`window` is one of `1d`, `7d`, `30d`, `90d`, `all` and defaults to `30d`.
+`window` is one of `1d`, `7d`, `30d`, `90d`, `all` and defaults to `30d` (retention
+and core default to `90d`, since they need whole periods; channels to `30d`).
+
+The four analysis views answer the questions leadership actually asks — do new
+members return, is the server carried by fewer people, which channels are dead,
+did the tournament work — and they share `/stats`'s allowlist rather than
+inventing a second permission system.
+
+**Embeds carry the absence words.** Discord has no room for a status field beside
+every number, so a withheld cell renders as `withheld (too few)`, an unmeasured one
+as `not collected`, and an unmeasured future period as `not yet`. A `0` in an embed
+always means a measured zero. If you see `—`, the field is missing from the
+payload, which is a bug worth reporting.
 
 Commands are registered on the guild at startup, so they appear immediately after
 the bot connects (guild-scoped, not global, to avoid Discord's propagation delay).

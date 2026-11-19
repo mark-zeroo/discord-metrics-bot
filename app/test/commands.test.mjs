@@ -9,6 +9,10 @@ import {
   ROLES_META_KEY,
   buildAccessEmbed,
   buildActivityEmbed,
+  buildChannelsEmbed,
+  buildCoreEmbed,
+  buildEventsEmbed,
+  buildRetentionEmbed,
   buildGrowthEmbed,
   buildSummaryEmbed,
   buildVoiceEmbed,
@@ -66,7 +70,7 @@ after(() => db?.close());
  * definitions
  * ------------------------------------------------------------------ */
 
-test('command definitions cover the four stats views and an access command', () => {
+test('command definitions cover every stats view and an access command', () => {
   const commands = definitions();
   const names = commands.map((c) => c.name);
   assert.deepEqual(names, ['stats', 'stats-access']);
@@ -74,7 +78,7 @@ test('command definitions cover the four stats views and an access command', () 
   const stats = commands.find((c) => c.name === 'stats');
   assert.deepEqual(
     stats.options.map((o) => o.name),
-    ['summary', 'activity', 'growth', 'voice'],
+    ['summary', 'activity', 'growth', 'voice', 'retention', 'core', 'channels', 'events'],
   );
   // Unrestricted by default: Discord must not hide it before anyone configures it.
   assert.equal(stats.default_member_permissions, undefined);
@@ -416,4 +420,213 @@ test('registerCommands reports failure without throwing', async () => {
   // Collection must not die because commands could not be registered.
   const applied = await registerCommands(guild, logger);
   assert.equal(applied, null);
+});
+
+/* ------------------------------------------------------------------ *
+ * analysis embeds: the absence words carry the whole suppression design
+ * ------------------------------------------------------------------ */
+
+const published = (value) => ({ status: 'published', value });
+
+test('retention embed distinguishes withheld, not yet and not collected', () => {
+  const embed = buildRetentionEmbed({
+    available: true,
+    window: '90d',
+    periods: [1, 7, 30],
+    cohorts: [
+      {
+        cohort: 'week of 2026-11-16',
+        members: published(7),
+        d1: { status: 'immature', value: null },
+        d7: { status: 'immature', value: null },
+      },
+    ],
+    cohorts_total: 12,
+    cohorts_truncated: true,
+    pooled: {
+      d1: { status: 'published', rate: 0.6, retained: 24, measured: 40, cohorts_included: 2 },
+      d7: { status: 'suppressed_small_count', value: null },
+      d30: { status: 'immature', value: null },
+    },
+    basis: { activity_from: '2026-11-19' },
+    caveats: ['Dn means active on the single UTC day n days after joining.'],
+  }).toJSON();
+
+  const byName = Object.fromEntries(embed.fields.map((f) => [f.name, f.value]));
+  assert.equal(byName['D1 (pooled)'], '60% — 24 of 40 members, 2 cohorts');
+  // Three different absences, three different words. A dash or a 0 here would
+  // collapse "hidden", "too early" and "never measured" into one thing.
+  assert.equal(byName['D7 (pooled)'], 'withheld (too few)');
+  assert.equal(byName['D30 (pooled)'], 'not yet');
+  assert.match(byName['Newest cohort'], /week of 2026-11-16 — 7 members/);
+  assert.match(byName['Newest cohort'], /D1 not yet/);
+  assert.equal(byName['Measured since'], '2026-11-19');
+  assert.equal(byName['Cohorts shown'], '1 newest of 12');
+  assert.match(embed.footer.text, /UTC day/);
+});
+
+test('retention embed says "not collected yet" rather than an empty table', () => {
+  const embed = buildRetentionEmbed({
+    available: true,
+    window: '90d',
+    periods: [1],
+    cohorts: [],
+    pooled: { d1: { status: 'withheld_suppression', value: null } },
+    basis: { activity_from: null },
+    caveats: [],
+  }).toJSON();
+  const byName = Object.fromEntries(embed.fields.map((f) => [f.name, f.value]));
+  assert.equal(byName['D1 (pooled)'], 'withheld');
+  assert.match(byName['Measured since'], /not collected yet/);
+});
+
+test('an unavailable analysis view names the configuration, not a zero', () => {
+  const embed = buildRetentionEmbed({
+    available: false,
+    reason: 'PER_MEMBER_COUNTERS is off, so no per-member rows are stored.',
+  }).toJSON();
+  assert.match(embed.title, /unavailable/);
+  assert.match(embed.description, /PER_MEMBER_COUNTERS/);
+  assert.match(embed.footer.text, /not a zero/);
+});
+
+test('core embed reports concentration, churn and a refused trend', () => {
+  const embed = buildCoreEmbed({
+    available: true,
+    window: '90d',
+    periods: [
+      {
+        period: 'week of 2026-11-09',
+        status: 'published',
+        active_members: published(86),
+        core_size: published(18),
+        concentration: {
+          share_of_messages_from_top_10_percent: 0.41,
+          members_for_80_percent_of_messages: published(18),
+          gini: 0.52,
+        },
+      },
+    ],
+    latest_transition: {
+      from: 'week of 2026-11-02',
+      to: 'week of 2026-11-09',
+      stayed_core: published(12),
+      left_core_active: published(3),
+      left_core_inactive: { status: 'suppressed_small_count', value: null },
+      left_server_confirmed: published(1),
+      core_retention_rate: published(0.667),
+    },
+    trend: { status: 'unmeasured', detail: 'A direction needs at least 4 publishable periods.' },
+    caveats: ['The core is a fixed fraction, so some turnover is guaranteed.'],
+  }).toJSON();
+
+  const byName = Object.fromEntries(embed.fields.map((f) => [f.name, f.value]));
+  assert.match(byName['Latest period (week of 2026-11-09)'], /86 active · core 18/);
+  assert.match(byName.Concentration, /top 10% wrote 41%/);
+  assert.match(byName.Concentration, /80% came from 18 members/);
+  assert.match(byName['Core churn (week of 2026-11-02 → week of 2026-11-09)'], /quiet withheld \(too few\)/);
+  assert.match(byName['Core churn (week of 2026-11-02 → week of 2026-11-09)'], /kept 67% of the core/);
+  assert.match(byName.Trend, /needs at least 4 publishable periods/);
+});
+
+test('core embed with no complete period explains when one will exist', () => {
+  const embed = buildCoreEmbed({
+    available: true,
+    window: '90d',
+    periods: [],
+    trend: {
+      status: 'immature',
+      detail: 'Per-member activity begins 2026-11-19, which falls inside the week that is still running.',
+    },
+    caveats: [],
+  }).toJSON();
+  assert.match(embed.description, /still running/);
+});
+
+test('channels embed names the dormant and unused channels, and the ones it cannot see', () => {
+  const embed = buildChannelsEmbed({
+    available: true,
+    window: '30d',
+    by_stage: { growing: 5, steady: 3, declining: 2, dormant: 1, never_used: 43, unmeasured: 60 },
+    stage_examples: {
+      dormant: { total: 1, truncated: false, channels: [{ id: '11', name: 'old-chat', messages: 0 }] },
+      never_used: {
+        total: 43,
+        truncated: true,
+        channels: [{ id: '12', name: 'dusty', messages: 0 }, { id: '13', name: 'dustier', messages: 0 }],
+      },
+    },
+    counts: { invisible_to_bot: 60 },
+    caveats: ['dormant means no message or voice for 21 days.'],
+  }).toJSON();
+
+  const byName = Object.fromEntries(embed.fields.map((f) => [f.name, f.value]));
+  assert.match(byName['By stage'], /growing 5 · steady 3 · declining 2/);
+  assert.equal(byName['Dormant (1)'], '<#11>');
+  assert.match(byName['Never used (43)'], /`dusty`, `dustier` … \+41 more/);
+  assert.match(byName['Not measured'], /60 channels the bot cannot see/);
+  assert.match(byName['Not measured'], /not an empty one/);
+});
+
+test('events embed shows uplift where it exists and the reason where it does not', () => {
+  const embed = buildEventsEmbed({
+    tags: [
+      {
+        name: 'Weekend Cup',
+        status: 'past',
+        during: { messages: 760, joins: 2 },
+        uplift: { messages: 1.4 },
+        uplift_status: { messages: { status: 'published' } },
+      },
+      {
+        name: 'Weekend 2',
+        status: 'past',
+        during: { messages: 380, joins: 1 },
+        uplift: null,
+        uplift_status: { messages: { status: 'refused', code: 'baseline_too_short' } },
+      },
+      {
+        name: 'Weekend 3',
+        status: 'upcoming',
+        during: null,
+        uplift: null,
+        uplift_status: { messages: { status: 'refused', code: 'not_started' } },
+      },
+    ],
+    caveats: [],
+  }).toJSON();
+
+  const values = embed.fields.map((f) => f.value);
+  assert.match(values[0], /760 msgs · 2 joins · uplift 1\.4×/);
+  assert.match(values[1], /baseline too short/);
+  assert.equal(values[2], 'not started · not started');
+});
+
+test('events embed with no tags says how to add one', () => {
+  const embed = buildEventsEmbed({ tags: [] }).toJSON();
+  assert.match(embed.description, /tag CLI/);
+});
+
+test('the analysis subcommands are wired and reply with an embed', async () => {
+  saveAllowedRoles(db, []); // unrestricted
+  // This fixture has per-member counters off and no channel structure, so three of
+  // the four answer "unavailable" — which is the point: they must still answer,
+  // with the reason, rather than throwing inside the interaction.
+  for (const subcommand of ['retention', 'core', 'channels', 'events']) {
+    const interaction = fakeInteraction({ subcommand, options: { window: '90d', cohort: 'week', limit: 3 } });
+    assert.equal(await handler()(interaction), true, `${subcommand} should be claimed`);
+    const [{ payload }] = interaction.calls;
+    assert.equal(payload.embeds?.length, 1, `${subcommand} should reply with one embed`);
+  }
+});
+
+test('a restricted user cannot reach the analysis views either', async () => {
+  saveAllowedRoles(db, [STAFF_ROLE]);
+  const denied = fakeInteraction({ subcommand: 'retention', roleIds: ['unrelated'] });
+  await handler()(denied);
+
+  const [{ payload }] = denied.calls;
+  assert.match(payload.content, /restricted/i);
+  assert.equal(payload.embeds, undefined, 'no numbers for a denied caller');
+  saveAllowedRoles(db, []);
 });

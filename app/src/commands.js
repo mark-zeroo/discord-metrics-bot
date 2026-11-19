@@ -1,6 +1,9 @@
 import { EmbedBuilder, PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
 
 import * as Q from './api/queries.js';
+import { retention } from './api/cohorts.js';
+import { coreConcentration } from './api/core.js';
+import { channelLifecycle } from './api/lifecycle.js';
 import { WINDOWS } from './time.js';
 
 /**
@@ -235,6 +238,289 @@ export function buildVoiceEmbed(data) {
     .setFooter({ text: footer(data?.caveats, 'Member-seconds, excluding deafened members.') });
 }
 
+/* ------------------------------------------------------------------ *
+ * suppression-aware rendering
+ * ------------------------------------------------------------------ */
+
+/**
+ * Words for absence.
+ *
+ * An embed has no room for a status field beside every number, so the distinction
+ * has to live in the value itself. "withheld", "not yet" and "not collected" are
+ * three different facts, and printing 0 or a dash for any of them would undo the
+ * suppression design at the last step — the one place a reader sees the number.
+ */
+const ABSENCE = {
+  suppressed_small_count: 'withheld (too few)',
+  suppressed_complementary: 'withheld (too few)',
+  withheld_suppression: 'withheld',
+  immature: 'not yet',
+  unmeasured: 'not collected',
+  no_data: 'no data',
+  refused: 'declined',
+};
+
+function cellText(cell, render = (v) => num(v)) {
+  if (!cell || typeof cell !== 'object') return '—';
+  if (cell.status === 'published') return render(cell.value);
+  return ABSENCE[cell.status] ?? '—';
+}
+
+const pct = (value) => `${Math.round(value * 100)}%`;
+
+/**
+ * Retention cells are {status, rate, retained, measured}, not {status, value}.
+ * Rendering them through cellText() printed a dash for a perfectly good 0% —
+ * which is the one outcome this whole design exists to avoid.
+ */
+const retentionCell = (cell) => (cell?.status === 'published' ? pct(cell.rate) : cellText(cell));
+
+/** Why an uplift was not quoted, in words short enough for a field. */
+const UPLIFT_ABSENCE = {
+  not_started: 'not started',
+  window_unobserved: 'window not collected',
+  window_too_short: 'window too short',
+  baseline_unmeasurable: 'no baseline yet',
+  baseline_too_short: 'baseline too short',
+  matched_baseline_thin: 'baseline too thin',
+  no_baseline_activity: 'no baseline activity',
+  insufficient_volume: 'too little activity',
+  overlapping_event: 'overlaps another tag',
+};
+
+function unavailableEmbed(title, data, fallback) {
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setColor(0xed4245)
+    .setDescription(data?.reason ?? fallback)
+    .setFooter({ text: 'This is a configuration or coverage state, not a zero.' });
+}
+
+/* ------------------------------------------------------------------ *
+ * embeds for the analysis endpoints
+ * ------------------------------------------------------------------ */
+
+export function buildRetentionEmbed(data) {
+  if (data?.available === false) {
+    return unavailableEmbed('Retention — unavailable', data, 'Cohort retention needs per-member counters.');
+  }
+
+  const fields = [];
+  const pooled = data?.pooled ?? {};
+  for (const period of data?.periods ?? []) {
+    const label = `d${period}`;
+    const cell = pooled[label] ?? {};
+    const value =
+      cell.status === 'published'
+        ? `${pct(cell.rate)} — ${num(cell.retained)} of ${num(cell.measured)} members, ` +
+          `${num(cell.cohorts_included)} cohort${cell.cohorts_included === 1 ? '' : 's'}`
+        : cellText(cell);
+    fields.push({ name: `D${period} (pooled)`, value, inline: true });
+  }
+
+  const newest = Array.isArray(data?.cohorts) ? data.cohorts[data.cohorts.length - 1] : null;
+  if (newest) {
+    fields.push({
+      name: 'Newest cohort',
+      value:
+        `${newest.cohort} — ${cellText(newest.members)} members\n` +
+        `D1 ${retentionCell(newest.d1)} · D7 ${retentionCell(newest.d7)}`,
+      inline: false,
+    });
+  }
+
+  fields.push({
+    name: 'Measured since',
+    value: data?.basis?.activity_from
+      ? data.basis.activity_from
+      : 'not collected yet — per-member activity starts on the first message',
+    inline: false,
+  });
+
+  if (data?.cohorts_truncated) {
+    fields.push({
+      name: 'Cohorts shown',
+      value: `${num(data.cohorts.length)} newest of ${num(data.cohorts_total)}`,
+      inline: true,
+    });
+  }
+
+  return new EmbedBuilder()
+    .setTitle(`Cohort retention — last ${data?.window ?? 'window'}`)
+    .setColor(0x9b59b6)
+    .addFields(fields)
+    .setFooter({ text: footer(data?.caveats, 'Dn is activity on the day n days after joining.') });
+}
+
+export function buildCoreEmbed(data) {
+  if (data?.available === false) {
+    return unavailableEmbed('Core — unavailable', data, 'Core analysis needs per-member counters.');
+  }
+
+  const periods = Array.isArray(data?.periods) ? data.periods : [];
+  const latest = periods[periods.length - 1];
+  if (!latest) {
+    return new EmbedBuilder()
+      .setTitle(`Core — last ${data?.window ?? 'window'}`)
+      .setColor(0xfee75c)
+      .setDescription(data?.trend?.detail ?? 'No complete period has been measured yet.')
+      .setFooter({ text: footer(data?.caveats, 'A period has to finish before it can be described.') });
+  }
+
+  const fields = [
+    {
+      name: `Latest period (${latest.period})`,
+      value: `${cellText(latest.active_members)} active · core ${cellText(latest.core_size)}`,
+      inline: false,
+    },
+  ];
+
+  const c = latest.concentration;
+  if (c) {
+    fields.push({
+      name: 'Concentration',
+      value:
+        `top 10% wrote ${pct(c.share_of_messages_from_top_10_percent)} · ` +
+        `80% came from ${cellText(c.members_for_80_percent_of_messages)} members · ` +
+        `gini ${c.gini}`,
+      inline: false,
+    });
+  } else {
+    // A full sentence belongs in the description, not in a metric field: the field
+    // should say *what* the number is, the description should say why it is absent.
+    fields.push({ name: 'Concentration', value: 'withheld (too few in the core)', inline: false });
+  }
+
+  const t = data?.latest_transition;
+  if (t) {
+    fields.push({
+      name: `Core churn (${t.from} → ${t.to})`,
+      value:
+        `stayed ${cellText(t.stayed_core)} · slipped ${cellText(t.left_core_active)} · ` +
+        `quiet ${cellText(t.left_core_inactive)} · left ${cellText(t.left_server_confirmed)}\n` +
+        `kept ${cellText(t.core_retention_rate, pct)} of the core`,
+      inline: false,
+    });
+  }
+
+  const trend = data?.trend;
+  fields.push({
+    name: 'Trend',
+    value:
+      trend?.status === 'published'
+        ? `${trend.gini.direction.replace(/_/g, ' ')} · gini ${trend.gini.early} → ${trend.gini.late} ` +
+          `over ${num(trend.periods_compared)} periods`
+        : (trend?.detail ?? 'not enough periods'),
+    inline: false,
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Core of regulars — last ${data?.window ?? 'window'}`)
+    .setColor(0xfee75c)
+    .addFields(fields);
+  if (!latest.concentration && latest.reason) embed.setDescription(latest.reason);
+  return embed
+    .setFooter({ text: footer(data?.caveats, 'Core is a share of active members, not a list of names.') });
+}
+
+const STAGE_ORDER = ['growing', 'steady', 'declining', 'low_volume', 'dormant', 'never_used', 'created_unused', 'removed', 'unmeasured'];
+const STAGE_LABEL = {
+  growing: 'growing',
+  steady: 'steady',
+  declining: 'declining',
+  low_volume: 'low volume',
+  dormant: 'dormant',
+  never_used: 'never used',
+  created_unused: 'created, unused',
+  removed: 'removed',
+  unmeasured: 'not measured',
+};
+
+export function buildChannelsEmbed(data) {
+  if (data?.available === false) {
+    return unavailableEmbed('Channels — unavailable', data, 'No server structure has been collected yet.');
+  }
+
+  const byStage = data?.by_stage ?? {};
+  const summary = STAGE_ORDER.filter((stage) => (byStage[stage] ?? 0) > 0)
+    .map((stage) => `${STAGE_LABEL[stage]} ${num(byStage[stage])}`)
+    .join(' · ');
+
+  const fields = [{ name: 'By stage', value: summary || 'No channels classified', inline: false }];
+
+  const channelList = (entry, renderName) => {
+    if (!entry || entry.channels.length === 0) return 'None';
+    const names = entry.channels.map(renderName).join(', ');
+    return entry.truncated ? `${names} … +${entry.total - entry.channels.length} more` : names;
+  };
+
+  const examples = data?.stage_examples ?? {};
+  fields.push({
+    name: `Dormant (${num(examples.dormant?.total ?? 0)})`,
+    value: channelList(examples.dormant, (c) => `<#${c.id}>`),
+    inline: false,
+  });
+  fields.push({
+    name: `Never used (${num(examples.never_used?.total ?? 0)})`,
+    value: channelList(examples.never_used, (c) => `\`${c.name}\``),
+    inline: false,
+  });
+
+  const invisible = data?.counts?.invisible_to_bot ?? 0;
+  if (invisible > 0) {
+    fields.push({
+      name: 'Not measured',
+      value:
+        `${num(invisible)} channel${invisible === 1 ? '' : 's'} the bot cannot see. ` +
+        'Activity there is missing from every total, and an unmeasured channel is not an empty one.',
+      inline: false,
+    });
+  }
+
+  return new EmbedBuilder()
+    .setTitle(`Channel lifecycle — last ${data?.window ?? 'window'}`)
+    .setColor(0x5865f2)
+    .addFields(fields)
+    .setFooter({ text: footer(data?.caveats, 'Unmeasured is not the same as unused.') });
+}
+
+export function buildEventsEmbed(data) {
+  const tags = Array.isArray(data?.tags) ? data.tags : [];
+  if (tags.length === 0) {
+    return new EmbedBuilder()
+      .setTitle('Tagged events')
+      .setColor(0x57f287)
+      .setDescription('No events have been tagged yet. Use the tag CLI to add one.')
+      .setFooter({ text: 'Uplift compares an event window with a weekday-matched baseline.' });
+  }
+
+  const fields = tags.slice(0, 5).map((tag) => {
+    const during = tag.during;
+    const uplift = tag.uplift?.messages;
+    const status = tag.uplift_status?.messages;
+    const outcome =
+      Number.isFinite(uplift)
+        ? `uplift ${uplift.toFixed(1)}×`
+        : (UPLIFT_ABSENCE[status?.code] ?? status?.code ?? 'no uplift');
+    const numbers = during
+      ? `${num(during.messages)} msgs · ${num(during.joins)} joins`
+      : tag.status === 'upcoming'
+        ? 'not started'
+        : 'window not collected';
+    return {
+      name: `${tag.name} (${tag.status})`,
+      value: `${numbers} · ${outcome}`,
+      inline: false,
+    };
+  });
+
+  return new EmbedBuilder()
+    .setTitle('Tagged events')
+    .setColor(0x57f287)
+    .addFields(fields)
+    .setFooter({ text: footer(data?.caveats, 'Uplift is correlation, and only quoted when it can be defended.') });
+}
+
 export function buildAccessEmbed(allowed, guild) {
   const lines = allowed.length
     ? allowed
@@ -290,6 +576,52 @@ export function definitions() {
     )
     .addSubcommand((sub) =>
       sub.setName('voice').setDescription('Voice hours and busiest channels').addStringOption(windowOption),
+    )
+    // The three analysis views below answer questions a server lead actually asks,
+    // and they inherit the same allowlist as the rest of /stats — one gate, not a
+    // second permission system to reason about.
+    .addSubcommand((sub) =>
+      sub
+        .setName('retention')
+        .setDescription('Do new members come back? (D1 / D7 / D30)')
+        .addStringOption(windowOption)
+        .addStringOption((option) =>
+          option
+            .setName('cohort')
+            .setDescription('Group joiners by week (default) or day')
+            .addChoices({ name: 'Week', value: 'week' }, { name: 'Day', value: 'day' }),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('core')
+        .setDescription('Is the server carried by fewer people than it used to be?')
+        .addStringOption(windowOption),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('channels')
+        .setDescription('Which channels are growing, fading, or never used?')
+        .addStringOption(windowOption)
+        .addIntegerOption((option) =>
+          option
+            .setName('limit')
+            .setDescription('Channels to list per group (default 5)')
+            .setMinValue(1)
+            .setMaxValue(10),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('events')
+        .setDescription('Did the last tagged events move the needle?')
+        .addIntegerOption((option) =>
+          option
+            .setName('limit')
+            .setDescription('How many events to show (default 3)')
+            .setMinValue(1)
+            .setMaxValue(5),
+        ),
     );
 
   const access = new SlashCommandBuilder()
@@ -416,6 +748,43 @@ async function handleStats(interaction, { db, config, logger }) {
       break;
     case 'voice':
       embed = buildVoiceEmbed(Q.voice(db, config, { window, bucket: 'day', top: 5, ts }));
+      break;
+    case 'retention':
+      embed = buildRetentionEmbed(
+        retention(db, config, {
+          // A quarter of cohorts, not the window's default: retention is about
+          // whether recent joiners stuck, and older cohorts are mostly unmeasured
+          // anyway on a young install.
+          window: resolveWindow(interaction.options.getString('window') ?? '90d'),
+          cohort: interaction.options.getString('cohort') ?? 'week',
+          periods: [1, 7, 30],
+          limit: 8,
+          ts,
+        }),
+      );
+      break;
+    case 'core':
+      embed = buildCoreEmbed(
+        coreConcentration(db, config, {
+          window: resolveWindow(interaction.options.getString('window') ?? '90d'),
+          bucket: 'week',
+          ts,
+        }),
+      );
+      break;
+    case 'channels':
+      embed = buildChannelsEmbed(
+        channelLifecycle(db, config, {
+          window: resolveWindow(interaction.options.getString('window') ?? '30d'),
+          limit: interaction.options.getInteger('limit') ?? 5,
+          ts,
+        }),
+      );
+      break;
+    case 'events':
+      embed = buildEventsEmbed(
+        Q.tags(db, config, { limit: interaction.options.getInteger('limit') ?? 3, ts }),
+      );
       break;
     default:
       await reply(interaction, { content: `Unknown subcommand: ${sub}`, ephemeral: true });
