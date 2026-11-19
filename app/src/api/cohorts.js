@@ -263,7 +263,10 @@ export function retention(
         rate: rateCell.value,
         retained: retainedCell.value,
         measured: measuredCell.value,
-        observed_day: isoDate(dayOf(members[0].joined_ts) + p * DAY),
+        // Only a day cohort has one observation day. A weekly cohort's members
+        // each have their own day n, so a single label here would be a false
+        // precision; the not_yet_due / not_observed counts carry what matters.
+        observed_day: cohort === 'day' ? isoDate(dayOf(members[0].joined_ts) + p * DAY) : null,
         // Every one of these is a count of people, so every one is guarded. The
         // breakdown matters: "not due yet" and "not observed" are different
         // reasons for a missing rate and only one of them resolves with time.
@@ -276,7 +279,16 @@ export function retention(
         not_yet_due: countCell(immature, { k, base: size }),
         not_observed: countCell(unmeasured, { k, base: size }),
       };
-      cells.push(retainedCell, measuredCell);
+      // Everything that is a count of people goes into the suppression summary,
+      // including the explanatory ones: a block that reports 2 withheld cells while
+      // the row shows five is a reason to distrust the whole table.
+      cells.push(
+        retainedCell,
+        measuredCell,
+        entry[label].left_before_day,
+        entry[label].not_yet_due,
+        entry[label].not_observed,
+      );
     }
 
     return entry;
