@@ -506,4 +506,9 @@ test('quality reports the anonymity floor and which days were observed', async (
   assert.ok(body.collector_days);
   assert.equal(typeof body.collector_days.recorded, 'number');
   assert.match(body.collector_days.note, /not observed/);
+  // This instance runs with PER_MEMBER_COUNTERS=off, so the per-member
+  // diagnostics are absent rather than zero. The populated shape is covered by
+  // the analytics test that runs in hmac mode.
+  assert.equal(body.privacy.per_member_rows.member_day, null);
+  assert.deepEqual(body.privacy.per_member_rows.tables, []);
 });

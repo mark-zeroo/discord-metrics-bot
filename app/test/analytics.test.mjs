@@ -1194,3 +1194,21 @@ test('seed counts voice states it cannot resolve to a member', () => {
   assert.equal(stats.lastSeedStates, 1, 'the voice state was visible');
   assert.equal(stats.lastSeedUnknown, 1, 'but not resolvable, which is now reported');
 });
+
+test('quality reports whether the per-member daily grain is filling', () => {
+  const db = openDb(':memory:');
+  const ts = hourOf(now());
+  db.run('INSERT INTO member_day(day_ts, user_hmac, messages, voice_s) VALUES(?,?,?,0)', dayOf(ts), 'a', 3);
+  db.run('INSERT INTO member_day(day_ts, user_hmac, messages, voice_s) VALUES(?,?,?,0)', dayOf(ts) - 86400, 'b', 1);
+  db.run(
+    'INSERT INTO member_tenure(user_hmac, joined_ts, left_ts, source, recorded_ts) VALUES(?,?,NULL,?,?)',
+    'a', dayOf(ts) - 10 * 86400, 'backfill', ts,
+  );
+
+  const out = Q.qualityReport(db, cfg(), { ts });
+  assert.equal(out.privacy.per_member_rows.member_day.rows, 2);
+  assert.equal(out.privacy.per_member_rows.member_day.days, 2);
+  assert.equal(out.privacy.per_member_rows.member_day.first_day, new Date((dayOf(ts) - 86400) * 1000).toISOString().slice(0, 10));
+  assert.equal(out.privacy.per_member_rows.member_tenure.spans, 1);
+  assert.equal(out.privacy.per_member_rows.member_tenure.open_spans, 1);
+});

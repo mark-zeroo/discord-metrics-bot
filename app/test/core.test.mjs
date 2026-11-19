@@ -279,3 +279,28 @@ test('lastCompletePeriodStart never returns the period containing now', () => {
   const firstOfMonth = Math.floor(Date.UTC(2026, 10, 1) / 1000);
   assert.ok(lastCompletePeriodStart(firstOfMonth + HOUR, 'month') < firstOfMonth);
 });
+
+test('an empty period list says whether to wait or to widen the window', () => {
+  const db = openDb(':memory:');
+  // Per-member data begins on this (still running) week's Monday, so the only
+  // complete week predates it.
+  const grainStart = week(0);
+  db.run('INSERT INTO member_day(day_ts, user_hmac, messages, voice_s) VALUES(?,?,?,0)', grainStart, 'u1', 5);
+
+  const waiting = coreConcentration(db, cfg(), { window: window90, bucket: 'week', ts: TS });
+  assert.deepEqual(waiting.periods, []);
+  assert.equal(waiting.trend.status, STATUS.immature);
+  assert.match(waiting.trend.detail, /first complete period with per-member data is week of/);
+  // The first measurable period starts next week and only completes the week after.
+  assert.equal(waiting.trend.measurable_from, isoDate(week(0) + 14 * DAY));
+  assert.doesNotMatch(waiting.trend.detail, /No complete period falls inside this window/);
+
+  // A window too short to contain one complete week is the other case entirely.
+  const narrow = coreConcentration(db, cfg(), {
+    window: { label: '1d', seconds: DAY },
+    bucket: 'week',
+    ts: TS,
+  });
+  assert.equal(narrow.trend.status, STATUS.unmeasured);
+  assert.match(narrow.trend.detail, /shorter than one complete week/);
+});

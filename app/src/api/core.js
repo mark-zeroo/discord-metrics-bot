@@ -144,6 +144,13 @@ export function coreConcentration(
   const periodTo = starts.length ? periodEnd(starts[starts.length - 1], bucket) : periodEnd(newest, bucket);
 
   if (starts.length === 0) {
+    // Two very different reasons produce an empty list, and saying "no complete
+    // period falls inside this window" for both sent a reader looking at their
+    // window when the answer was "wait until Monday".
+    const windowStart = window.label === 'all' ? activityFrom : ts - window.seconds;
+    const periodSpan = bucket === 'month' ? 32 * DAY : bucket === 'day' ? DAY : 7 * DAY;
+    const completeExists = periodEnd(newest, bucket) > windowStart;
+    const firstMeasurable = bucketStart(activityFrom + periodSpan, bucket);
     return {
       available: true,
       window: window.label,
@@ -151,7 +158,23 @@ export function coreConcentration(
       share,
       periods: [],
       transitions: [],
-      trend: { status: STATUS.unmeasured, detail: 'No complete period falls inside this window.' },
+      trend: completeExists
+        ? {
+            status: STATUS.immature,
+            detail:
+              `Per-member activity begins ${isoDate(activityFrom)}, which falls inside the ` +
+              `${bucket} that is still running. The first complete period with per-member data is ` +
+              `${bucketLabel(firstMeasurable, bucket)}, measurable from ` +
+              `${isoDate(periodEnd(firstMeasurable, bucket))}.`,
+            first_measurable_period: bucketLabel(firstMeasurable, bucket),
+            measurable_from: isoDate(periodEnd(firstMeasurable, bucket)),
+          }
+        : {
+            status: STATUS.unmeasured,
+            detail:
+              `This window is shorter than one complete ${bucket}, so there is no period to ` +
+              'describe regardless of how much activity it contains.',
+          },
       status_legend: legend,
       suppression: suppressionBlock({ k, cells: [] }),
       caveats: caveats(config),

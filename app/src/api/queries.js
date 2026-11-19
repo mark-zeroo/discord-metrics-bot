@@ -920,6 +920,32 @@ export function qualityReport(db, config, { ts = now(), voiceStats = null } = {}
                 member_tenure_open: 'kept while the membership is open',
               }
             : null,
+        // Is the daily grain actually filling? Retention and core are empty until
+        // it does, and "no rows yet" and "nobody was active" look identical from
+        // the outside. Row counts, never rows.
+        member_day:
+          config.privacy.perMemberCounters === 'hmac'
+            ? (() => {
+                const row = db.get(
+                  'SELECT COUNT(*) AS rows, COUNT(DISTINCT day_ts) AS days, MIN(day_ts) AS first_day, MAX(day_ts) AS last_day FROM member_day',
+                );
+                return {
+                  rows: row?.rows ?? 0,
+                  days: row?.days ?? 0,
+                  first_day: row?.first_day ? isoDate(row.first_day) : null,
+                  last_day: row?.last_day ? isoDate(row.last_day) : null,
+                };
+              })()
+            : null,
+        member_tenure:
+          config.privacy.perMemberCounters === 'hmac'
+            ? (() => {
+                const row = db.get(
+                  'SELECT COUNT(*) AS spans, SUM(CASE WHEN left_ts IS NULL THEN 1 ELSE 0 END) AS open_spans FROM member_tenure',
+                );
+                return { spans: row?.spans ?? 0, open_spans: row?.open_spans ?? 0 };
+              })()
+            : null,
       },
     },
     coverage: channelCoverage
