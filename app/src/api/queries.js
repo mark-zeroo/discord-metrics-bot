@@ -2313,7 +2313,12 @@ function tagImpact(db, tag, config, { hourlyCutoff, ts }) {
       days_observed: Number(baseMsg?.days ?? 0),
       // Unclamped: a baseline that predates collection is covered by 0 days, and
       // a 1 here contradicted days_observed: 0 while the rates divided by 1.
-      days_covered: Number(coveredDays.toFixed(2)),
+      // Renamed from days_covered, which read like the denominator for
+      // messages_per_day. It is not: the rate divides by matched.days_used. This
+      // only says how much of the baseline window fell inside collection, and the
+      // three day counts in this block (days_observed, coverage_span_days,
+      // matched.days_used) measure three different things on purpose.
+      coverage_span_days: Number(coveredDays.toFixed(2)),
       // The uplift denominator. Trailing averages are kept above for context and
       // comparability; these are what the ratio actually divides by.
       matched: {
@@ -2397,9 +2402,11 @@ export function tags(db, config, { limit = 20, ts = now() } = {}) {
       `uplift divides the activity observed inside the window by a weekday-matched baseline built from the ` +
         `trailing ${config.analytics.eventBaselineDays} days: a Saturday event is compared with Saturdays, ` +
         'because the average day is not a weekend. It is correlation, not proof of cause.',
-      `baseline.messages_per_day is the plain trailing average, kept for context; baseline.matched is the ` +
-        'denominator uplift actually uses. The two differ on any server with a weekly rhythm, and quoting ' +
-        'the first as if it were the second overstates weekend events.',
+      `baseline.messages_per_day is the plain trailing average, kept for context; baseline.matched.days_used ` +
+        'is the denominator uplift actually uses. The two differ on any server with a weekly rhythm, and ' +
+        'quoting the first as if it were the second overstates weekend events. coverage_span_days is ' +
+        'neither: it is how much of the baseline window fell inside collection, and dividing anything by ' +
+        'it is wrong.',
       `A baseline with fewer than ${config.analytics.eventBaselineNoisyDays} days observed is refused ` +
         'rather than quoted with a warning: an uplift derived from a week of history does not survive ' +
         'a second look.',

@@ -481,7 +481,7 @@ test('tag impact compares the window against the trailing baseline window', () =
   assert.equal(tag.during.messages, 126);
   assert.equal(tag.baseline.window_days, 28);
   assert.equal(tag.baseline.days_observed, 28);
-  assert.equal(tag.baseline.days_covered, 28);
+  assert.equal(tag.baseline.coverage_span_days, 28);
   assert.equal(tag.baseline.messages_per_day, 100);
   // 42/hour works out to ~1008/day against a 100/day baseline.
   assert.equal(tag.uplift.messages, 10.08);
@@ -1053,7 +1053,7 @@ test('a baseline that is mostly in the future is reported as unusable, not dilut
 
   const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
   assert.equal(tag.status, 'upcoming');
-  assert.ok(tag.baseline.days_covered < 1, 'coverage is the observed slice, not the span');
+  assert.ok(tag.baseline.coverage_span_days < 1, 'coverage is the observed slice, not the span');
   assert.equal(tag.baseline.messages_per_day, null, 'no diluted rate');
   assert.equal(tag.baseline.joins_per_day, null);
   assert.match(tag.note, /has not started/);
@@ -1133,7 +1133,7 @@ test('baseline coverage is not floored at one day when nothing was observed', ()
 
   const [tag] = Q.tags(db, cfg(), { limit: 5, ts }).tags;
   assert.equal(tag.baseline.days_observed, 0);
-  assert.equal(tag.baseline.days_covered, 0, 'no baseline coverage, not 1');
+  assert.equal(tag.baseline.coverage_span_days, 0, 'no baseline coverage, not 1');
   assert.equal(tag.uplift, null);
 });
 
