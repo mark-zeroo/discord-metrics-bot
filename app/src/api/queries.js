@@ -1,5 +1,6 @@
 import { DAY, HOUR, iso, isoDate, rollup, bucketLabel, bucketStart, dayOf, hourOf } from '../time.js';
 import { ParamError } from './params.js';
+import { STATUS, STATUS_LEGEND, countCell, isPublished, suppressPartition, suppressionBlock } from './suppression.js';
 
 /**
  * All read paths live here. Every statement is a fixed string with bound
@@ -1511,6 +1512,45 @@ export function engagement(db, config, { window, ts = now() }) {
     };
   }
 
+  const k = config.privacy.minCell;
+  const activeCell = countCell(active, { k, base: active });
+  const snap = db.get('SELECT members, bots FROM snapshot ORDER BY ts DESC LIMIT 1');
+  const humans = snap ? snap.members - snap.bots : null;
+  const cells = [activeCell];
+
+  // A concentration statistic on a handful of active members is a description of
+  // those members. The same floor that guards the cohort tables decides whether
+  // this table is publishable at all.
+  if (!isPublished(activeCell)) {
+    return {
+      window: window.label,
+      available: true,
+      window_effective_from: iso(effectiveFrom),
+      window_capped: capped,
+      active_members: activeCell,
+      total_messages: total,
+      concentration: null,
+      concentration_status: {
+        status: STATUS.suppressed_small_count,
+        reason:
+          `${active} active member${active === 1 ? '' : 's'} is below the anonymity floor of ${k}: ` +
+          'a Gini or an "80% of messages come from N people" figure would describe those people. ' +
+          'total_messages is unaffected.',
+      },
+      lurkers: { humans, active_members: activeCell, active_share_of_humans: null },
+      status_legend: STATUS_LEGEND,
+      suppression: suppressionBlock({ k, cells }),
+      caveats: [
+        ...(coverage ? [coverage] : []),
+        `Counts only members who sent at least one message since ${iso(effectiveFrom)}; everyone else is a lurker.`,
+        `Capped to hourly retention (${config.storage.retentionHourlyDays} days): older per-member rows are pruned.`,
+        'Members are pseudonymous HMACs, never IDs. Ranks are computed in-process and no per-member row is returned.',
+        'Needs several weeks of per-member rows before the distribution is stable.',
+      ],
+      quality: quality(db, config, ts),
+    };
+  }
+
   const topN = Math.max(1, Math.ceil(active * 0.1));
   const topShare = messages.slice(0, topN).reduce((a, b) => a + b, 0) / total;
 
@@ -1536,38 +1576,56 @@ export function engagement(db, config, { window, ts = now() }) {
     ['200-999', (n) => n >= 200 && n < 1000],
     ['1000+', (n) => n >= 1000],
   ];
-  const distribution = {};
-  for (const [label, test] of bands) distribution[label] = messages.filter(test).length;
 
-  const snap = db.get('SELECT members, bots FROM snapshot ORDER BY ts DESC LIMIT 1');
-  const humans = snap ? snap.members - snap.bots : null;
+  // Bands partition the active members, and active_members is published next to
+  // them, so a single withheld band would be recoverable by subtraction. The
+  // partition suppressor withholds a second band whenever that becomes possible.
+  const distribution = suppressPartition({
+    k,
+    counts: bands.map(([label, test]) => ({ key: label, count: messages.filter(test).length })),
+    total: active,
+  });
+  cells.push(...distribution.cells);
+
+  const membersFor80Cell = countCell(membersFor80, { k, base: active });
+  cells.push(membersFor80Cell);
 
   return {
     window: window.label,
     available: true,
     window_effective_from: iso(effectiveFrom),
     window_capped: capped,
-    active_members: active,
+    active_members: activeCell,
     total_messages: total,
     concentration: {
-      members_for_80_percent_of_messages: membersFor80,
+      members_for_80_percent_of_messages: membersFor80Cell,
       share_of_messages_from_top_10_percent: Number(topShare.toFixed(3)),
       median_messages_per_active_member: median,
       gini: gini(messages),
-      distribution,
+      distribution: distribution.cells.map((c) => ({ band: c.key, members: c })),
+      distribution_suppressed: distribution.suppressed,
+      distribution_secondary_suppressed: distribution.secondary_suppressed,
     },
     lurkers: {
       humans,
-      active_members: active,
+      active_members: activeCell,
+      // The share plus a known human count recovers the number of active members,
+      // so it is withheld whenever that count is.
       active_share_of_humans:
-        humans && humans > 0 ? Number((active / humans).toFixed(3)) : null,
+        isPublished(activeCell) && humans && humans > 0
+          ? Number((active / humans).toFixed(3))
+          : null,
     },
+    status_legend: STATUS_LEGEND,
+    suppression: suppressionBlock({ k, cells }),
     caveats: [
       ...(coverage ? [coverage] : []),
       `Counts only members who sent at least one message since ${iso(effectiveFrom)}; everyone else is a lurker.`,
       `Capped to hourly retention (${config.storage.retentionHourlyDays} days): older per-member rows are pruned.`,
       'Members are pseudonymous HMACs, never IDs. Ranks are computed in-process and no per-member row is returned.',
       'Needs several weeks of per-member rows before the distribution is stable.',
+      `Volume bands below the anonymity floor of ${k} are withheld, and a second band is withheld when one withheld band could be recovered by subtracting the others from active_members.`,
+      'A band count is a number of people, not a number of messages: do not add the bands up as if they were activity.',
     ],
     quality: quality(db, config, ts),
   };
