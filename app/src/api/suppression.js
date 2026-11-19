@@ -213,6 +213,15 @@ export function suppressionBlock({ k, cells = [], extra = {} } = {}) {
     min_cell: k,
     suppressed_cells: suppressed,
     status_counts: counts,
+    // Withholding is a policy outcome, so the reader gets the knob that produced
+    // it. A table that is mostly withheld on a small server is not broken, and
+    // saying so stops someone "fixing" the collector instead of the floor.
+    hint:
+      suppressed > 0
+        ? `${suppressed} of ${cells.length} cells are withheld at PRIVACY_MIN_CELL=${k}. ` +
+          'The floor is a deliberate policy choice: lowering it publishes more and protects less, ' +
+          'and it cannot be lowered from the API.'
+        : null,
     policy:
       `Any count of people below ${k}, or whose complement within its group is below ${k}, is ` +
       'withheld, and a second cell is withheld when one withheld cell could be recovered by ' +

@@ -717,6 +717,14 @@ What the floor does **not** do: it does not suppress totals (`/v1/summary` still
 members, messages, posters), and it cannot protect against an operator who reads the
 database directly. It guards what the API hands to a model.
 
+**Picking the number.** `k` applies to a cell *and* to its complement, so a cohort of 20
+publishes a split of 13/7 but not 19/1. That is the standard rule and it is strict: on a
+server gaining fewer than ~20 members a week, many weekly cohorts will be withheld at the
+default of 10. The payload says so in `suppression.hint` rather than looking broken, and
+the floor is the knob — lowering it publishes more and protects less. Five is a defensible
+choice for a community that mostly wants the trend; ten is the right default for a server
+whose membership is sensitive.
+
 ---
 
 ## Server structure

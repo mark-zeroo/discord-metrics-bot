@@ -162,6 +162,16 @@ test('the suppression block counts statuses and states the policy', () => {
   assert.equal(block.status_counts[STATUS.published], 1);
   assert.equal(block.status_counts[STATUS.unmeasured], 1);
   assert.match(block.policy, /below 10/);
+  // The knob that produced the withholding travels with it, so a mostly-withheld
+  // table is not mistaken for a broken collector.
+  assert.match(block.hint, /PRIVACY_MIN_CELL=10/);
+  assert.match(block.hint, /protects less/);
+});
+
+test('the suppression block has no hint when nothing was withheld', () => {
+  const block = suppressionBlock({ k: K, cells: [countCell(50, { k: K, base: 50 })] });
+  assert.equal(block.suppressed_cells, 0);
+  assert.equal(block.hint, null);
 });
 
 test('every status in the vocabulary has a legend entry', () => {
